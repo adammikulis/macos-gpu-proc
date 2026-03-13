@@ -107,8 +107,8 @@ class SummaryBar(Static):
 class SystemGpuBar(Static):
     """System-wide GPU utilization with sparkline."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
         self.history: list[float] = []
 
     def update_value(self, total_pct: float) -> None:

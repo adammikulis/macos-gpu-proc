@@ -60,7 +60,7 @@ __all__ = [
     "system_gpu_stats",
 ]
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 
 def gpu_percent(pid: int = 0, interval: float = 0.5) -> float:
@@ -116,7 +116,7 @@ def sample_gpu(pids: list[int] | None = None, interval: float = 0.5) -> dict[int
     return result
 
 
-def snapshot(interval: float = 1.0) -> list[dict]:
+def snapshot(interval: float = 1.0, active_only: bool = True) -> list[dict]:
     """One-call GPU utilization snapshot for all processes.
 
     Auto-discovers every process using the GPU, measures utilization
@@ -125,6 +125,9 @@ def snapshot(interval: float = 1.0) -> list[dict]:
 
     Args:
         interval: Measurement window in seconds (default 1.0).
+        active_only: If True (default), only return processes with GPU
+            activity during the interval. Set to False to include all
+            processes that have a GPU client (even if idle).
 
     Returns:
         List of dicts, one per GPU-active process, sorted by gpu_percent::
@@ -197,7 +200,7 @@ def snapshot(interval: float = 1.0) -> list[dict]:
         cpu_pct = cpu_delta / interval_ns * 100 if interval_ns > 0 else 0
         power_w = energy_delta / (interval * 1e9) if interval > 0 else 0
 
-        if gpu_pct < 0.05 and gpu_delta <= 0:
+        if active_only and gpu_pct < 0.05 and gpu_delta <= 0:
             continue
 
         results.append({

@@ -82,6 +82,7 @@ gpu-proc --tui        # rich terminal UI with sparkline graphs (pip install maco
 gpu-proc --gui        # native floating window monitor (pip install macos-gpu-proc[gui])
 gpu-proc -i 1         # 1-second update interval
 gpu-proc --pid 1234   # monitor specific PID
+python -m macos_gpu_proc  # alternative entry point (same as gpu-proc)
 ```
 
 ## API Reference
@@ -102,6 +103,7 @@ gpu-proc --pid 1234   # monitor specific PID
 | `cpu_time_ns(pid)` | Cumulative CPU nanoseconds (user + system) |
 | `proc_info(pid)` | Full process stats (CPU, memory, energy, disk, threads) |
 | `system_gpu_stats()` | System GPU: utilization %, VRAM, model, core count |
+| `ppid(pid)` | Parent process ID for a PID (-1 on error) |
 
 ### proc_info fields
 

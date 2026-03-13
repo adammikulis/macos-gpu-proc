@@ -132,14 +132,46 @@ gpu-proc --pid 1234   # monitor specific PID
 
 ## How It Works
 
-On macOS, every Metal GPU client (command queue) is registered as an `AGXDeviceUserClient` child of the AGX accelerator in the IORegistry. Each carries:
+Apple doesn't provide a public API for per-process GPU metrics on Apple Silicon. The commonly referenced `task_info(TASK_POWER_INFO_V2)` has a `task_gpu_utilisation` field, but Apple never populates it — it always returns 0.
 
-- `IOUserClientCreator` — the PID and process name
-- `AppUsage` — array of `{API, accumulatedGPUTime}` entries
+The data *does* exist, in the IORegistry. Every Metal command queue creates an `AGXDeviceUserClient` object as a child of the GPU accelerator. You can see them with:
 
-This data is world-readable from the IORegistry. No `task_for_pid`, no `sudo`, no SIP changes, no private frameworks.
+```bash
+ioreg -c AGXDeviceUserClient -r -d 0
+```
 
-CPU/memory/energy stats come from `proc_pid_rusage(RUSAGE_INFO_V6)` and `proc_pidinfo(PROC_PIDTASKINFO)`.
+Each entry carries:
+
+```
+"IOUserClientCreator" = "pid 4245, python3.12"
+"AppUsage" = ({"API"="Metal", "accumulatedGPUTime"=123632000000})
+```
+
+`accumulatedGPUTime` is cumulative GPU nanoseconds — sample twice, divide by elapsed time, and you have utilization %. This is world-readable, no sudo or SIP changes needed.
+
+**The catch:** `IOServiceGetMatchingServices("AGXDeviceUserClient")` returns 0 results because user client objects are `!registered` in the IOKit matching system. You have to find the parent accelerator first and walk its children:
+
+```c
+// Find the AGX accelerator
+IOServiceGetMatchingServices(kIOMainPortDefault,
+    IOServiceMatching("AGXAccelerator"), &iter);
+
+// Iterate its children in the IOService plane
+io_service_t accel = IOIteratorNext(iter);
+IORegistryEntryGetChildIterator(accel, kIOServicePlane, &child_iter);
+
+// Each child is an AGXDeviceUserClient with AppUsage data
+while ((child = IOIteratorNext(child_iter))) {
+    CFStringRef creator = IORegistryEntryCreateCFProperty(child,
+        CFSTR("IOUserClientCreator"), ...);  // "pid 4245, python3.12"
+    CFArrayRef usage = IORegistryEntryCreateCFProperty(child,
+        CFSTR("AppUsage"), ...);             // [{accumulatedGPUTime: ns}]
+}
+```
+
+System-wide GPU utilization comes from the accelerator's `PerformanceStatistics` property (`Device Utilization %`, `Tiler Utilization %`, `Renderer Utilization %`).
+
+CPU, memory, energy, disk I/O, and thread stats come from `proc_pid_rusage(RUSAGE_INFO_V6)` and `proc_pidinfo(PROC_PIDTASKINFO)` — both unprivileged for same-user processes.
 
 ## Requirements
 

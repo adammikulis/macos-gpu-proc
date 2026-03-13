@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "macos-gpu-proc"
-version = "0.1.1"
+version = "0.1.2"
 description = "Per-process GPU utilization, CPU, memory, and energy monitoring for macOS Apple Silicon — no sudo needed."
 readme = "README.md"
 license = {text = "MIT"}

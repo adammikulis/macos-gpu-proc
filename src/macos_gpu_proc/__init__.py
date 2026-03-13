@@ -59,7 +59,7 @@ __all__ = [
     "system_gpu_stats",
 ]
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 def gpu_percent(pid: int = 0, interval: float = 0.5) -> float:

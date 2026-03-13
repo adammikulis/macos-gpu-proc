@@ -366,17 +366,30 @@ static PyObject* py_cpu_time_ns(PyObject* self, PyObject* args) {
 
 PyDoc_STRVAR(proc_info_doc,
 "proc_info(pid) -> dict | None\n\n"
-"Return comprehensive process stats matching Activity Monitor's columns.\n\n"
+"Return comprehensive process stats from rusage_info_v6 and proc_pidinfo.\n\n"
 "Returns dict with keys:\n"
+"    CPU:\n"
 "    - 'cpu_ns': int — cumulative CPU time (user + system) in nanoseconds\n"
-"    - 'cpu_user_ns': int — user CPU time in nanoseconds\n"
-"    - 'cpu_system_ns': int — system CPU time in nanoseconds\n"
-"    - 'memory': int — physical footprint in bytes (Activity Monitor 'Memory')\n"
+"    - 'cpu_user_ns' / 'cpu_system_ns': int — split CPU time\n"
+"    - 'instructions': int — retired instructions\n"
+"    - 'cycles': int — CPU cycles\n"
+"    - 'runnable_time': int — time process was runnable (ns)\n"
+"    - 'billed_system_time' / 'serviced_system_time': int — billed CPU (ns)\n"
+"    Memory:\n"
+"    - 'memory': int — physical footprint in bytes\n"
 "    - 'real_memory': int — resident memory in bytes\n"
-"    - 'disk_read_bytes': int — cumulative bytes read from disk\n"
-"    - 'disk_write_bytes': int — cumulative bytes written to disk\n"
-"    - 'energy_nj': int — cumulative energy in nanojoules (delta for watts)\n"
+"    - 'wired_size': int — wired (non-pageable) memory in bytes\n"
+"    - 'peak_memory': int — lifetime peak physical footprint\n"
 "    - 'neural_footprint': int — Neural Engine memory in bytes\n"
+"    - 'pageins': int — page-in count (memory pressure indicator)\n"
+"    Disk:\n"
+"    - 'disk_read_bytes' / 'disk_write_bytes': int — cumulative disk I/O\n"
+"    - 'logical_writes': int — logical writes including CoW (bytes)\n"
+"    Energy:\n"
+"    - 'energy_nj': int — cumulative energy in nanojoules (delta for watts)\n"
+"    - 'idle_wakeups': int — package idle wakeups\n"
+"    - 'interrupt_wakeups': int — interrupt wakeups\n"
+"    Other:\n"
 "    - 'threads': int — current thread count\n\n"
 "Returns None on error. No special privileges needed for same-user processes.");
 
@@ -415,14 +428,29 @@ static PyObject* py_proc_info(PyObject* self, PyObject* args) {
     /* Memory */
     SET_ULL("memory", ri.ri_phys_footprint);
     SET_ULL("real_memory", ri.ri_resident_size);
+    SET_ULL("wired_size", ri.ri_wired_size);
+    SET_ULL("peak_memory", ri.ri_lifetime_max_phys_footprint);
     SET_ULL("neural_footprint", ri.ri_neural_footprint);
+    SET_ULL("pageins", ri.ri_pageins);
 
     /* Disk I/O */
     SET_ULL("disk_read_bytes", ri.ri_diskio_bytesread);
     SET_ULL("disk_write_bytes", ri.ri_diskio_byteswritten);
+    SET_ULL("logical_writes", ri.ri_logical_writes);
 
     /* Energy (nanojoules) — cumulative, take deltas for power rate */
     SET_ULL("energy_nj", ri.ri_energy_nj);
+
+    /* CPU perf counters */
+    SET_ULL("instructions", ri.ri_instructions);
+    SET_ULL("cycles", ri.ri_cycles);
+    SET_ULL("runnable_time", ri.ri_runnable_time);
+    SET_LL("billed_system_time", ri.ri_billed_system_time);
+    SET_LL("serviced_system_time", ri.ri_serviced_system_time);
+
+    /* Wakeups (energy efficiency) */
+    SET_ULL("idle_wakeups", ri.ri_pkg_idle_wkups);
+    SET_ULL("interrupt_wakeups", ri.ri_interrupt_wkups);
 
     /* Thread count */
     if (pti_size >= (int)sizeof(pti)) {
@@ -452,9 +480,14 @@ PyDoc_STRVAR(system_gpu_stats_doc,
 "    - 'renderer_utilization': int — Renderer Utilization %%\n"
 "    - 'alloc_system_memory': int — total GPU-allocated system memory (bytes)\n"
 "    - 'in_use_system_memory': int — in-use GPU system memory (bytes)\n"
+"    - 'in_use_system_memory_driver': int — driver-side in-use memory\n"
+"    - 'allocated_pb_size': int — parameter buffer allocation (bytes)\n"
 "    - 'recovery_count': int — GPU recovery (crash) count\n"
+"    - 'last_recovery_time': int — timestamp of last GPU recovery\n"
 "    - 'split_scene_count': int — tiler split scene events\n"
-"    - 'tiled_scene_bytes': int — current tiled scene buffer size");
+"    - 'tiled_scene_bytes': int — current tiled scene buffer size\n"
+"    - 'model': str — GPU model name\n"
+"    - 'gpu_core_count': int — number of GPU cores");
 
 static PyObject* py_system_gpu_stats(PyObject* self, PyObject* args) {
     io_iterator_t iter;
@@ -484,7 +517,10 @@ static PyObject* py_system_gpu_stats(PyObject* self, PyObject* args) {
                 {"Renderer Utilization %", "renderer_utilization"},
                 {"Alloc system memory", "alloc_system_memory"},
                 {"In use system memory", "in_use_system_memory"},
+                {"In use system memory (driver)", "in_use_system_memory_driver"},
+                {"Allocated PB Size", "allocated_pb_size"},
                 {"recoveryCount", "recovery_count"},
+                {"lastRecoveryTime", "last_recovery_time"},
                 {"SplitSceneCount", "split_scene_count"},
                 {"TiledSceneBytes", "tiled_scene_bytes"},
                 {NULL, NULL}

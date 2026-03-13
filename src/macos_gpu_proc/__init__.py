@@ -62,7 +62,7 @@ __all__ = [
     "system_gpu_stats",
 ]
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 
 def _snapshot() -> dict[int, dict]:
@@ -124,7 +124,11 @@ def sample_gpu(pids: list[int] | None = None, interval: float = 0.5) -> dict[int
     return result
 
 
-def snapshot(interval: float = 1.0, active_only: bool = True) -> list[dict]:
+def snapshot(
+    interval: float = 1.0,
+    active_only: bool = True,
+    detailed: bool = False,
+) -> list[dict]:
     """One-call GPU utilization snapshot for all processes.
 
     Auto-discovers every process using the GPU, measures utilization
@@ -136,23 +140,20 @@ def snapshot(interval: float = 1.0, active_only: bool = True) -> list[dict]:
         active_only: If True (default), only return processes with GPU
             activity during the interval. Set to False to include all
             processes that have a GPU client (even if idle).
+        detailed: If True, include extended fields (IPC, wakeups, disk I/O,
+            peak memory, wired memory, neural engine). Default False returns
+            the most commonly needed fields.
 
     Returns:
-        List of dicts, one per GPU-active process, sorted by gpu_percent::
+        List of dicts sorted by gpu_percent descending. Default fields::
 
-            [
-                {
-                    'pid': 4245,
-                    'name': 'python3.12',
-                    'gpu_percent': 85.7,
-                    'gpu_ns': 1714800000,      # GPU ns used during interval
-                    'cpu_percent': 102.3,       # can exceed 100% (multi-core)
-                    'memory_mb': 2048.5,        # physical footprint
-                    'energy_w': 12.3,           # power draw in watts
-                    'threads': 24,
-                },
-                ...
-            ]
+            pid, name, gpu_percent, gpu_ns, cpu_percent, memory_mb,
+            energy_w, threads
+
+        With ``detailed=True``, adds::
+
+            peak_memory_mb, wired_mb, neural_mb, disk_read_mb, disk_write_mb,
+            instructions, cycles, ipc, idle_wakeups, pageins
 
     Example::
 
@@ -163,46 +164,37 @@ def snapshot(interval: float = 1.0, active_only: bool = True) -> list[dict]:
                   f"CPU {proc['cpu_percent']:5.1f}%  {proc['memory_mb']:.0f}MB")
     """
     # First sample
-    clients1 = {}
-    for c in gpu_clients():
-        pid = c["pid"]
-        if pid not in clients1:
-            clients1[pid] = {"name": c["name"], "gpu_ns": 0}
-        clients1[pid]["gpu_ns"] += c["gpu_ns"]
-
-    cpu1 = {}
-    energy1 = {}
-    for pid in clients1:
-        ns = cpu_time_ns(pid)
-        cpu1[pid] = ns if ns >= 0 else 0
+    snap1 = _snapshot()
+    info1: dict[int, dict] = {}
+    for pid in snap1:
         info = proc_info(pid)
-        energy1[pid] = info["energy_nj"] if info else 0
+        if info:
+            info1[pid] = info
 
     _time.sleep(interval)
 
     # Second sample
-    clients2 = {}
-    for c in gpu_clients():
-        pid = c["pid"]
-        if pid not in clients2:
-            clients2[pid] = {"name": c["name"], "gpu_ns": 0}
-        clients2[pid]["gpu_ns"] += c["gpu_ns"]
-
+    snap2 = _snapshot()
     interval_ns = interval * 1_000_000_000
     results = []
-    for pid, c2 in clients2.items():
-        c1 = clients1.get(pid)
+    for pid, c2 in snap2.items():
+        c1 = snap1.get(pid)
         gpu_delta = c2["gpu_ns"] - (c1["gpu_ns"] if c1 else c2["gpu_ns"])
         if gpu_delta <= 0 and c1 is None:
             continue
 
-        cpu2 = cpu_time_ns(pid)
-        cpu2 = cpu2 if cpu2 >= 0 else 0
-        cpu_delta = cpu2 - cpu1.get(pid, cpu2)
-
         info = proc_info(pid)
+        i1 = info1.get(pid)
+
+        # CPU delta
+        cpu2 = info["cpu_ns"] if info else 0
+        cpu1_val = i1["cpu_ns"] if i1 else cpu2
+        cpu_delta = cpu2 - cpu1_val
+
+        # Energy delta
         energy2 = info["energy_nj"] if info else 0
-        energy_delta = energy2 - energy1.get(pid, energy2)
+        energy1_val = i1["energy_nj"] if i1 else energy2
+        energy_delta = energy2 - energy1_val
 
         gpu_pct = min(gpu_delta / interval_ns * 100, 100) if interval_ns > 0 else 0
         cpu_pct = cpu_delta / interval_ns * 100 if interval_ns > 0 else 0
@@ -211,16 +203,33 @@ def snapshot(interval: float = 1.0, active_only: bool = True) -> list[dict]:
         if active_only and gpu_pct < 0.05 and gpu_delta <= 0:
             continue
 
-        results.append({
+        MB = 1024 * 1024
+        entry: dict = {
             "pid": pid,
             "name": c2["name"],
             "gpu_percent": round(gpu_pct, 1),
             "gpu_ns": gpu_delta,
             "cpu_percent": round(cpu_pct, 1),
-            "memory_mb": round(info["memory"] / (1024 * 1024), 1) if info else 0,
+            "memory_mb": round(info["memory"] / MB, 1) if info else 0,
             "energy_w": round(power_w, 2),
             "threads": info["threads"] if info else 0,
-        })
+        }
+
+        if detailed and info:
+            entry.update({
+                "peak_memory_mb": round(info["peak_memory"] / MB, 1),
+                "wired_mb": round(info["wired_size"] / MB, 1),
+                "neural_mb": round(info["neural_footprint"] / MB, 1),
+                "disk_read_mb": round(info["disk_read_bytes"] / MB, 1),
+                "disk_write_mb": round(info["disk_write_bytes"] / MB, 1),
+                "instructions": info["instructions"],
+                "cycles": info["cycles"],
+                "ipc": round(info["instructions"] / info["cycles"], 2) if info["cycles"] > 0 else 0,
+                "idle_wakeups": info["idle_wakeups"],
+                "pageins": info["pageins"],
+            })
+
+        results.append(entry)
 
     results.sort(key=lambda r: r["gpu_percent"], reverse=True)
     return results

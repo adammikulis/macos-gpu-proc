@@ -92,6 +92,7 @@ python -m macos_gpu_proc  # alternative entry point (same as gpu-proc)
 | Function | Description |
 |----------|-------------|
 | `snapshot(interval=1.0)` | **One call does it all** — returns `[{'pid', 'name', 'gpu_percent', 'cpu_percent', 'memory_mb', 'energy_w', ...}]` |
+| `snapshot(detailed=True)` | Extended fields: IPC, wakeups, peak memory, neural engine, disk I/O |
 
 ### C Extension Functions
 
@@ -109,15 +110,31 @@ python -m macos_gpu_proc  # alternative entry point (same as gpu-proc)
 
 | Field | Description |
 |-------|-------------|
+| **CPU** | |
 | `cpu_ns` | Cumulative CPU time (user + system) in nanoseconds |
 | `cpu_user_ns` | User CPU time |
 | `cpu_system_ns` | System/kernel CPU time |
+| `instructions` | Retired instructions (for IPC calculation) |
+| `cycles` | CPU cycles (for IPC calculation) |
+| `runnable_time` | Time process was runnable but not running (ns) |
+| `billed_system_time` | Billed CPU time (ns) |
+| `serviced_system_time` | Serviced CPU time (ns) |
+| **Memory** | |
 | `memory` | Physical memory footprint (bytes) |
 | `real_memory` | Resident memory (bytes) |
+| `wired_size` | Wired (non-pageable) memory (bytes) |
+| `peak_memory` | Lifetime peak physical footprint (bytes) |
 | `neural_footprint` | Neural Engine memory (bytes) |
+| `pageins` | Page-in count (memory pressure indicator) |
+| **Disk** | |
 | `disk_read_bytes` | Cumulative disk reads |
 | `disk_write_bytes` | Cumulative disk writes |
+| `logical_writes` | Logical writes including CoW (bytes) |
+| **Energy** | |
 | `energy_nj` | Cumulative energy (nanojoules) — delta over time = watts |
+| `idle_wakeups` | Package idle wakeups (energy efficiency metric) |
+| `interrupt_wakeups` | Interrupt wakeups |
+| **Other** | |
 | `threads` | Current thread count |
 
 ### system_gpu_stats fields
@@ -131,6 +148,12 @@ python -m macos_gpu_proc  # alternative entry point (same as gpu-proc)
 | `renderer_utilization` | Renderer utilization % |
 | `alloc_system_memory` | Total GPU-allocated system memory |
 | `in_use_system_memory` | Currently used GPU memory |
+| `in_use_system_memory_driver` | Driver-side in-use memory |
+| `allocated_pb_size` | Parameter buffer allocation (bytes) |
+| `recovery_count` | GPU recovery (crash) count |
+| `last_recovery_time` | Timestamp of last GPU recovery |
+| `split_scene_count` | Tiler split scene events |
+| `tiled_scene_bytes` | Current tiled scene buffer size |
 
 ## How It Works
 

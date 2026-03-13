@@ -44,22 +44,6 @@ def _format_table(
     return "\n".join(lines)
 
 
-def _snapshot() -> dict[int, dict]:
-    """Take a snapshot of all GPU clients with their GPU time and names.
-
-    Returns dict: pid -> {'name': str, 'gpu_ns': int}
-    """
-    from macos_gpu_proc._native import gpu_clients
-
-    by_pid: dict[int, dict] = {}
-    for c in gpu_clients():
-        pid = c["pid"]
-        if pid not in by_pid:
-            by_pid[pid] = {"name": c["name"], "gpu_ns": 0}
-        by_pid[pid]["gpu_ns"] += c["gpu_ns"]
-    return by_pid
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="gpu-proc",
@@ -106,6 +90,7 @@ def main() -> None:
         run_tui(pids=args.pid, interval=args.interval, top_n=args.top)
         return
 
+    from macos_gpu_proc import _snapshot
     from macos_gpu_proc._native import cpu_time_ns, proc_info
 
     if args.once:

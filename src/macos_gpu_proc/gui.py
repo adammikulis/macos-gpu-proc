@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import resource
+import subprocess
 import threading
 import time
 
@@ -185,6 +187,19 @@ window.addEventListener('resize', drawChart);
 </html>"""
 
 
+def _get_hw_memsize() -> int:
+    """Read hw.memsize (total physical memory in bytes). Cached at module level."""
+    try:
+        return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+    except Exception:
+        return 0
+
+
+# Cache at import time — physical memory never changes
+_HW_MEMSIZE = _get_hw_memsize()
+_PAGE_SIZE = resource.getpagesize()
+
+
 class _GpuGuiApi:
     """Python API exposed to the webview JS context."""
 
@@ -202,22 +217,12 @@ class _GpuGuiApi:
         t = threading.Thread(target=self._poll_loop, daemon=True)
         t.start()
 
-    def _snapshot(self) -> dict[int, dict]:
-        from macos_gpu_proc._native import gpu_clients
-
-        by_pid: dict[int, dict] = {}
-        for c in gpu_clients():
-            pid = c["pid"]
-            if pid not in by_pid:
-                by_pid[pid] = {"name": c["name"], "gpu_ns": 0}
-            by_pid[pid]["gpu_ns"] += c["gpu_ns"]
-        return by_pid
-
     def _collect(self) -> dict:
+        from macos_gpu_proc import _snapshot
         from macos_gpu_proc._native import cpu_time_ns, proc_info
 
         now = time.monotonic()
-        snap = self._snapshot()
+        snap = _snapshot()
 
         curr_cpu: dict[int, int] = {}
         for pid in snap:
@@ -263,12 +268,9 @@ class _GpuGuiApi:
             data["total_gpu_pct"] = 0
             data["total_cpu_pct"] = 0
 
-        # System memory via sysctl + vm_stat (no psutil needed)
-        import subprocess
+        # System memory — hw.memsize is cached, only vm_stat is polled
+        data["memory_total_gb"] = round(_HW_MEMSIZE / (1024**3), 1)
         try:
-            hw_mem = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
-            data["memory_total_gb"] = round(hw_mem / (1024**3), 1)
-            # Parse vm_stat for used memory
             vm = subprocess.check_output(["vm_stat"], text=True)
             pages: dict[str, int] = {}
             for line in vm.splitlines():
@@ -277,12 +279,10 @@ class _GpuGuiApi:
                     v = v.strip().rstrip(".")
                     if v.isdigit():
                         pages[k.strip()] = int(v)
-            page_size = 16384  # Apple Silicon default
             used = (pages.get("Pages active", 0) + pages.get("Pages wired down", 0)
-                    + pages.get("Pages occupied by compressor", 0)) * page_size
+                    + pages.get("Pages occupied by compressor", 0)) * _PAGE_SIZE
             data["memory_used_gb"] = round(used / (1024**3), 1)
         except Exception:
-            data["memory_total_gb"] = 0
             data["memory_used_gb"] = 0
 
         self._prev_snap = snap
@@ -292,8 +292,9 @@ class _GpuGuiApi:
 
     def _poll_loop(self) -> None:
         # Take initial baseline
-        self._prev_snap = self._snapshot()
+        from macos_gpu_proc import _snapshot
         from macos_gpu_proc._native import cpu_time_ns
+        self._prev_snap = _snapshot()
         for pid in self._prev_snap:
             ns = cpu_time_ns(pid)
             self._prev_cpu[pid] = ns if ns >= 0 else 0

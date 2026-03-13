@@ -43,6 +43,7 @@ from ._native import (
     gpu_clients,
     gpu_time_ns,
     gpu_time_ns_multi,
+    ppid,
     proc_info,
     system_gpu_stats,
 )
@@ -54,13 +55,28 @@ __all__ = [
     "gpu_time_ns",
     "gpu_time_ns_multi",
     "gpu_percent",
+    "ppid",
     "proc_info",
     "sample_gpu",
     "snapshot",
     "system_gpu_stats",
 ]
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
+
+
+def _snapshot() -> dict[int, dict]:
+    """Take a snapshot of all GPU clients aggregated by PID.
+
+    Returns dict: pid -> {'name': str, 'gpu_ns': int}
+    """
+    by_pid: dict[int, dict] = {}
+    for c in gpu_clients():
+        pid = c["pid"]
+        if pid not in by_pid:
+            by_pid[pid] = {"name": c["name"], "gpu_ns": 0}
+        by_pid[pid]["gpu_ns"] += c["gpu_ns"]
+    return by_pid
 
 
 def gpu_percent(pid: int = 0, interval: float = 0.5) -> float:
@@ -75,15 +91,10 @@ def gpu_percent(pid: int = 0, interval: float = 0.5) -> float:
 
     Returns:
         GPU utilization as a percentage (0.0 - 100.0).
-        Returns -1.0 if the process cannot be read.
     """
     t1 = gpu_time_ns(pid)
-    if t1 < 0:
-        return -1.0
     _time.sleep(interval)
     t2 = gpu_time_ns(pid)
-    if t2 < 0:
-        return -1.0
     delta_ns = t2 - t1
     interval_ns = interval * 1_000_000_000
     return min((delta_ns / interval_ns) * 100.0, 100.0) if interval_ns > 0 else 0.0
@@ -107,12 +118,9 @@ def sample_gpu(pids: list[int] | None = None, interval: float = 0.5) -> dict[int
     interval_ns = interval * 1_000_000_000
     result: dict[int, float] = {}
     for pid in pids:
-        ns1 = t1.get(pid, -1)
-        ns2 = t2.get(pid, -1)
-        if ns1 < 0 or ns2 < 0:
-            result[pid] = -1.0
-        else:
-            result[pid] = min(((ns2 - ns1) / interval_ns) * 100.0, 100.0)
+        ns1 = t1.get(pid, 0)
+        ns2 = t2.get(pid, 0)
+        result[pid] = min(((ns2 - ns1) / interval_ns) * 100.0, 100.0)
     return result
 
 
@@ -244,6 +252,7 @@ class GpuMonitor:
         self._last_ns: int | None = None
         self._last_time: float | None = None
         self._samples: list[float] = []
+        self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -259,20 +268,20 @@ class GpuMonitor:
         pid = self.pid if self.pid != 0 else os.getpid()
         pids = [pid]
         if self.children:
-            # Scan GPU clients — any child processes using GPU will appear
+            # Only include GPU clients whose parent PID matches target
             for c in gpu_clients():
-                if c["pid"] != pid and c["pid"] not in pids:
-                    pids.append(c["pid"])
+                cpid = c["pid"]
+                if cpid != pid and cpid not in pids and ppid(cpid) == pid:
+                    pids.append(cpid)
         return pids
 
     def _read_total_ns(self) -> int:
         """Read total GPU ns across all tracked PIDs."""
         pids = self._collect_pids()
         if len(pids) == 1:
-            ns = gpu_time_ns(pids[0])
-            return ns if ns >= 0 else 0
+            return gpu_time_ns(pids[0])
         results = gpu_time_ns_multi(pids)
-        return sum(v for v in results.values() if v >= 0)
+        return sum(results.values())
 
     def sample(self) -> float:
         """Compute GPU utilization since the last call to sample().
@@ -298,14 +307,16 @@ class GpuMonitor:
             return 0.0
 
         pct = min((delta_ns / (elapsed_s * 1_000_000_000)) * 100.0, 100.0)
-        self._samples.append(pct)
+        with self._lock:
+            self._samples.append(pct)
         return pct
 
     def reset(self) -> None:
         """Reset the monitor state."""
         self._last_ns = None
         self._last_time = None
-        self._samples.clear()
+        with self._lock:
+            self._samples.clear()
 
     def start(self, interval: float = 2.0) -> None:
         """Start background sampling thread.
@@ -338,7 +349,8 @@ class GpuMonitor:
     @property
     def last(self) -> float:
         """Most recent GPU utilization sample, or 0.0 if none."""
-        return self._samples[-1] if self._samples else 0.0
+        with self._lock:
+            return self._samples[-1] if self._samples else 0.0
 
     def summary(self) -> dict[str, float]:
         """Aggregate statistics from all samples.
@@ -347,11 +359,13 @@ class GpuMonitor:
             Dict with keys: gpu_pct_avg, gpu_pct_min, gpu_pct_max,
             num_samples.
         """
-        if not self._samples:
-            return {"gpu_pct_avg": 0, "gpu_pct_min": 0, "gpu_pct_max": 0, "num_samples": 0}
+        with self._lock:
+            if not self._samples:
+                return {"gpu_pct_avg": 0, "gpu_pct_min": 0, "gpu_pct_max": 0, "num_samples": 0}
+            samples = list(self._samples)
         return {
-            "gpu_pct_avg": sum(self._samples) / len(self._samples),
-            "gpu_pct_min": min(self._samples),
-            "gpu_pct_max": max(self._samples),
-            "num_samples": len(self._samples),
+            "gpu_pct_avg": sum(samples) / len(samples),
+            "gpu_pct_min": min(samples),
+            "gpu_pct_max": max(samples),
+            "num_samples": len(samples),
         }

@@ -17,7 +17,8 @@ from textual.containers import Vertical
 from textual.reactive import reactive
 from textual.widgets import Footer, Header, Static
 
-from ._native import cpu_time_ns, gpu_clients, proc_info, system_gpu_stats
+from . import _snapshot
+from ._native import cpu_time_ns, proc_info, system_gpu_stats
 
 # ---------------------------------------------------------------------------
 # Sparkline renderer (unicode block chars)
@@ -214,17 +215,8 @@ class GpuProcApp(App):
         yield Vertical(id="process-list")
         yield Footer()
 
-    def _snapshot(self) -> dict[int, dict]:
-        by_pid: dict[int, dict] = {}
-        for c in gpu_clients():
-            pid = c["pid"]
-            if pid not in by_pid:
-                by_pid[pid] = {"name": c["name"], "gpu_ns": 0}
-            by_pid[pid]["gpu_ns"] += c["gpu_ns"]
-        return by_pid
-
     def on_mount(self) -> None:
-        snap = self._snapshot()
+        snap = _snapshot()
         self._prev_snap = snap
         for pid in snap:
             ns = cpu_time_ns(pid)
@@ -241,7 +233,7 @@ class GpuProcApp(App):
             return
         elapsed_ns = elapsed_s * 1_000_000_000
 
-        snap = self._snapshot()
+        snap = _snapshot()
         curr_cpu: dict[int, int] = {}
         curr_energy: dict[int, int] = {}
         for pid in snap:

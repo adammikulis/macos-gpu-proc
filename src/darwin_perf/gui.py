@@ -86,6 +86,12 @@ canvas {
         <div class="bar-track"><div class="bar-fill fill-mem" id="ram-bar" style="width:0%"></div></div>
         <span class="bar-value" id="ram-val">--</span>
     </div>
+    <div class="bar-row" style="cursor:pointer" onclick="toggleSensors()">
+        <span class="bar-label">Temps</span>
+        <span class="bar-value" id="temp-val" style="width:auto;flex:1;text-align:left;color:#f59e0b">--</span>
+        <span id="temp-toggle" style="color:#475569;font-size:10px">▶ sensors</span>
+    </div>
+    <div id="sensor-detail" style="display:none;font-size:10px;color:#94a3b8;padding:2px 0 4px 56px;line-height:1.6"></div>
 </div>
 
 <div class="section-label">GPU History</div>
@@ -155,8 +161,14 @@ function update(data) {
     document.getElementById('ram-bar').style.width = ramPct + '%';
     document.getElementById('ram-val').textContent = data.memory_used_gb.toFixed(0) + '/' + data.memory_total_gb.toFixed(0) + 'GB';
 
-    // Stats
-    document.getElementById('stats').innerHTML = '<b>' + data.gpu_clients + ' GPU clients</b>';
+    // Stats + temps
+    const ct = (data.cpu_temp ?? 0).toFixed(0);
+    const gt = (data.gpu_temp ?? 0).toFixed(0);
+    document.getElementById('stats').innerHTML =
+        '<b>' + data.gpu_clients + ' clients</b>';
+    document.getElementById('temp-val').textContent =
+        'CPU ' + ct + '°C  GPU ' + gt + '°C';
+    if (data.sensors) updateSensors(data.sensors);
 
     // History
     gpuHistory.push(gpu);
@@ -176,6 +188,36 @@ function update(data) {
         '<span class="proc-val">' + p.mem.toFixed(0) + 'MB</span>' +
         '</div>'
     ).join('');
+}
+
+let sensorsVisible = false;
+function toggleSensors() {
+    sensorsVisible = !sensorsVisible;
+    const el = document.getElementById('sensor-detail');
+    const tog = document.getElementById('temp-toggle');
+    el.style.display = sensorsVisible ? 'block' : 'none';
+    tog.textContent = sensorsVisible ? '▼ sensors' : '▶ sensors';
+}
+
+function updateSensors(sensors) {
+    if (!sensorsVisible) return;
+    const el = document.getElementById('sensor-detail');
+    let html = '';
+    for (const [cat, label, color] of [
+        ['cpu_sensors', 'CPU', '#ef4444'],
+        ['gpu_sensors', 'GPU', '#a855f7'],
+        ['system_sensors', 'SYS', '#3b82f6']
+    ]) {
+        const s = sensors[cat] || {};
+        const keys = Object.keys(s).sort();
+        if (keys.length === 0) continue;
+        const vals = keys.map(k =>
+            k + ':' + s[k].toFixed(0)
+        ).join('  ');
+        html += '<span style="color:' + color + '">' +
+            label + '</span> ' + vals + '<br>';
+    }
+    el.innerHTML = html || 'No sensors';
 }
 
 window.addEventListener('resize', drawChart);
@@ -254,12 +296,21 @@ class _GpuGuiApi:
             data["total_gpu_pct"] = 0
             data["total_cpu_pct"] = 0
 
-        # System memory via Mach APIs (no subprocess)
-        from darwin_perf._native import system_stats
+        # System memory + temperatures
+        from darwin_perf._native import system_stats, temperatures
         sys = system_stats()
         GB = 1024**3
         data["memory_total_gb"] = round(sys.get("memory_total", 0) / GB, 1)
         data["memory_used_gb"] = round(sys.get("memory_used", 0) / GB, 1)
+
+        temps = temperatures()
+        data["cpu_temp"] = round(temps.get("cpu_avg", 0), 1)
+        data["gpu_temp"] = round(temps.get("gpu_avg", 0), 1)
+        data["sensors"] = {
+            "cpu_sensors": temps.get("cpu_sensors", {}),
+            "gpu_sensors": temps.get("gpu_sensors", {}),
+            "system_sensors": temps.get("system_sensors", {}),
+        }
 
         self._prev_snap = snap
         self._prev_cpu = curr_cpu

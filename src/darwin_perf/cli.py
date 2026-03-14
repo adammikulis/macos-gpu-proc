@@ -418,7 +418,10 @@ def main() -> None:
     if args.tui:
         from darwin_perf.tui import run_tui
 
-        run_tui(pids=args.pid, interval=args.interval, top_n=args.top)
+        run_tui(
+            pids=args.pid, interval=args.interval,
+            top_n=args.top, record_path=args.record,
+        )
         return
 
     if args.once:

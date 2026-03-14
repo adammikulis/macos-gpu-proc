@@ -1,15 +1,18 @@
-"""darwin-perf TUI: Rich terminal GPU monitor with live graphs.
+"""darwin-perf TUI: Rich terminal system monitor with live graphs.
 
-A full-screen terminal app showing per-process GPU utilization with
-sparkline history graphs, sorted by usage. No sudo needed.
+A full-screen terminal app showing per-process GPU utilization,
+CPU/GPU power, frequencies, temperatures, and memory — with
+sparkline history graphs. No sudo needed.
 
 Usage:
     darwin-perf --tui              # all GPU-active processes
     darwin-perf --tui -i 1         # 1s update interval
+    darwin-perf --tui --record f   # monitor + record to JSONL
 """
 
 from __future__ import annotations
 
+import json
 import time as _time
 
 from textual.app import App, ComposeResult
@@ -18,7 +21,7 @@ from textual.reactive import reactive
 from textual.widgets import Footer, Header, Static
 
 from . import _snapshot
-from ._native import cpu_time_ns, proc_info, system_gpu_stats
+from ._native import cpu_time_ns, proc_info, system_gpu_stats, temperatures
 
 # ---------------------------------------------------------------------------
 # Sparkline renderer (unicode block chars)
@@ -98,7 +101,7 @@ class ProcessRow(Static):
 
 
 class SummaryBar(Static):
-    """Top bar showing aggregate GPU stats."""
+    """Top bar showing aggregate GPU stats + system metrics."""
 
     total_gpu = reactive(0.0)
     process_count = reactive(0)
@@ -106,14 +109,20 @@ class SummaryBar(Static):
     model_name = reactive("")
     core_count = reactive(0)
     device_util = reactive(0)
+    cpu_temp = reactive(0.0)
+    gpu_temp = reactive(0.0)
+    recording = reactive("")
 
     def render(self) -> str:
+        rec = f"  │  [bold red]● REC {self.recording}[/bold red]" if self.recording else ""
         return (
             f"  [bold]{self.model_name}[/bold] ({self.core_count} cores)"
-            f"  │  [bold]GPU:[/bold] [green]{self.device_util}%[/green] (hw)"
+            f"  │  [bold]GPU:[/bold] [green]{self.device_util}%[/green]"
             f"  │  [bold]Sum:[/bold] [green]{self.total_gpu:5.1f}%[/green]"
             f"  │  [bold]Peak:[/bold] [yellow]{self.peak_gpu:5.1f}%[/yellow]"
-            f"  │  [bold]Clients:[/bold] {self.process_count}"
+            f"  │  [bold]CPU:[/bold] {self.cpu_temp:.0f}°C"
+            f"  │  [bold]GPU:[/bold] {self.gpu_temp:.0f}°C"
+            f"{rec}"
         )
 
 
@@ -143,6 +152,31 @@ class SystemGpuBar(Static):
         )
 
 
+class TempPanel(Static):
+    """Expandable temperature sensor panel."""
+
+    def update_temps(self, temps: dict) -> None:
+        lines = []
+        for category, label, color in [
+            ("cpu_sensors", "CPU", "red"),
+            ("gpu_sensors", "GPU", "magenta"),
+            ("system_sensors", "SYS", "blue"),
+        ]:
+            sensors = temps.get(category, {})
+            if not sensors:
+                continue
+            avg_key = category.replace("_sensors", "_avg")
+            avg = temps.get(avg_key, 0)
+            items = sorted(sensors.items())
+            vals = " ".join(f"{n}:{v:.0f}" for n, v in items)
+            lines.append(
+                f"  [{color}]{label}[/{color}] "
+                f"[bold]{avg:.1f}°C[/bold]  "
+                f"[dim]{vals}[/dim]"
+            )
+        self.update("\n".join(lines) if lines else "  [dim]No sensors[/dim]")
+
+
 # ---------------------------------------------------------------------------
 # Main TUI App
 # ---------------------------------------------------------------------------
@@ -170,6 +204,14 @@ class GpuProcApp(App):
         padding: 0 1;
         color: $text-muted;
     }
+    #temp-panel {
+        padding: 0 1;
+        border-bottom: solid $primary-lighten-2;
+        display: none;
+    }
+    #temp-panel.visible {
+        display: block;
+    }
     #process-list {
         height: 1fr;
         overflow-y: auto;
@@ -182,7 +224,9 @@ class GpuProcApp(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
-        ("r", "reset", "Reset history"),
+        ("R", "reset", "Reset history"),
+        ("r", "toggle_record", "Record"),
+        ("t", "toggle_temps", "Temps"),
     ]
 
     def __init__(
@@ -190,6 +234,7 @@ class GpuProcApp(App):
         pids: list[int] | None = None,
         interval: float = 2.0,
         top_n: int = 30,
+        record_path: str | None = None,
     ) -> None:
         super().__init__()
         self._target_pids = pids
@@ -201,11 +246,17 @@ class GpuProcApp(App):
         self._prev_time: float = 0
         self._rows: dict[int, ProcessRow] = {}
         self._all_totals: list[float] = []
+        self._record_path = record_path
+        self._record_file: object | None = None
+        self._record_count: int = 0
+        if record_path:
+            self._record_file = open(record_path, "w")
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield SummaryBar(id="summary")
         yield SystemGpuBar(id="system-bar")
+        yield TempPanel(id="temp-panel")
         yield Static(
             "      PID  GPU %  CPU %    Mem  Power  "
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  "
@@ -278,8 +329,9 @@ class GpuProcApp(App):
         total_pct = sum(r[2] for r in active)
         self._all_totals.append(total_pct)
 
-        # System-wide GPU stats
+        # System-wide GPU stats + temperatures
         sys_stats = system_gpu_stats()
+        temps = temperatures()
 
         summary = self.query_one("#summary", SummaryBar)
         summary.total_gpu = total_pct
@@ -288,6 +340,36 @@ class GpuProcApp(App):
         summary.model_name = sys_stats.get("model", "?")
         summary.core_count = sys_stats.get("gpu_core_count", 0)
         summary.device_util = sys_stats.get("device_utilization", 0)
+        summary.cpu_temp = temps.get("cpu_avg", 0)
+        summary.gpu_temp = temps.get("gpu_avg", 0)
+        summary.recording = self._record_path if self._record_file else ""
+
+        temp_panel = self.query_one("#temp-panel", TempPanel)
+        if temp_panel.has_class("visible"):
+            temp_panel.update_temps(temps)
+
+        # Write recording line if active
+        if self._record_file:
+            from ._native import system_stats as _sys_stats
+            record = {
+                "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "epoch": _time.time(),
+                "interval": self._interval,
+                "temperatures": temps,
+                "memory": _sys_stats(),
+                "gpu_stats": sys_stats,
+                "processes": [
+                    {"pid": pid, "name": name,
+                     "gpu_percent": round(gpu_pct, 1),
+                     "cpu_percent": round(cpu_pct, 1),
+                     "memory": mem_str,
+                     "energy_w": round(power_w, 2)}
+                    for pid, name, gpu_pct, cpu_pct, mem_str, power_w in active
+                ],
+            }
+            self._record_file.write(json.dumps(record) + "\n")
+            self._record_file.flush()
+            self._record_count += 1
 
         sys_bar = self.query_one("#system-bar", SystemGpuBar)
         sys_bar.update_value(
@@ -321,12 +403,40 @@ class GpuProcApp(App):
         sys_bar = self.query_one("#system-bar", SystemGpuBar)
         sys_bar.history.clear()
 
+    def action_toggle_temps(self) -> None:
+        """Toggle temperature sensor detail panel."""
+        panel = self.query_one("#temp-panel", TempPanel)
+        panel.toggle_class("visible")
+        if panel.has_class("visible"):
+            panel.update_temps(temperatures())
+
+    def action_toggle_record(self) -> None:
+        """Toggle recording on/off."""
+        if self._record_file:
+            self._record_file.close()
+            self._record_file = None
+            self.notify(
+                f"Recording stopped ({self._record_count} samples → {self._record_path})",
+                severity="information",
+            )
+        else:
+            import time
+            self._record_path = f"darwin-perf-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+            self._record_file = open(self._record_path, "w")
+            self._record_count = 0
+            self.notify(f"Recording to {self._record_path}", severity="warning")
+
+    def on_unmount(self) -> None:
+        if self._record_file:
+            self._record_file.close()
+
 
 def run_tui(
     pids: list[int] | None = None,
     interval: float = 2.0,
     top_n: int = 30,
+    record_path: str | None = None,
 ) -> None:
     """Launch the TUI app."""
-    app = GpuProcApp(pids=pids, interval=interval, top_n=top_n)
+    app = GpuProcApp(pids=pids, interval=interval, top_n=top_n, record_path=record_path)
     app.run()

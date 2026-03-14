@@ -1,17 +1,17 @@
-"""darwin-perf: Live per-process GPU utilization monitor for macOS.
+"""darwin-perf: System performance monitor and debugger for macOS.
 
-Like `top` or `htop`, but for GPU. Auto-discovers all processes using
-the GPU via IORegistry — no sudo needed.
+Like `top` but for GPU, CPU power, temperatures, and per-process metrics.
+Auto-discovers all processes using the GPU via IORegistry — no sudo needed.
 
 Usage:
-    darwin-perf              # monitor all GPU-active processes
+    darwin-perf              # live per-process GPU/CPU monitor
+    darwin-perf --json       # JSON line per update (pipe to jq, etc.)
+    darwin-perf --csv        # CSV output for spreadsheets
+    darwin-perf --record f   # record full system state to JSONL
+    darwin-perf --export f   # convert JSONL recording to CSV
+    darwin-perf --replay f   # replay a recorded session
     darwin-perf --pid 1234   # monitor specific PID
-    darwin-perf --top 10     # show top 10 GPU consumers
-    darwin-perf -i 1         # update every 1 second
-    darwin-perf --json       # JSON line per update
-    darwin-perf --csv        # CSV output
-    darwin-perf --record f   # record snapshots to JSONL file
-    darwin-perf --replay f   # replay a recorded JSONL file
+    darwin-perf -i 1         # 1-second update interval
 """
 
 from __future__ import annotations
@@ -164,26 +164,152 @@ def _run_csv(args):
 
 
 def _run_record(args):
-    """Record snapshots to a JSONL file."""
+    """Record full system snapshots to a JSONL file.
+
+    Each line contains: CPU/GPU power+frequency, temperatures, memory,
+    system GPU stats, and per-process GPU/CPU utilization.
+    """
     from darwin_perf import snapshot
 
     with open(args.record, "w") as f:
         iteration = 0
         while True:
-            data = snapshot(interval=args.interval, detailed=True)
+            data = snapshot(interval=args.interval, detailed=True, system=True)
             record = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "epoch": time.time(),
                 "interval": args.interval,
-                "processes": data,
+                **data,
             }
             f.write(json.dumps(record) + "\n")
             f.flush()
 
+            n_procs = len(data.get("processes", []))
+            cpu_w = data.get("cpu", {}).get("cpu_power_w", 0)
+            gpu_w = data.get("gpu", {}).get("gpu_power_w", 0)
+            temps = data.get("temperatures", {})
+            cpu_t = temps.get("cpu_avg", 0)
+            gpu_t = temps.get("gpu_avg", 0)
+            sys.stderr.write(
+                f"\r[{time.strftime('%H:%M:%S')}] "
+                f"CPU {cpu_w:.1f}W/{cpu_t:.0f}°C  "
+                f"GPU {gpu_w:.1f}W/{gpu_t:.0f}°C  "
+                f"{n_procs} procs  →  {args.record}"
+            )
+            sys.stderr.flush()
+
             iteration += 1
             if 0 < args.count <= iteration:
                 break
-            # snapshot() already sleeps for interval, no additional sleep needed
+        sys.stderr.write("\n")
+
+
+def _run_export(args):
+    """Export a recorded JSONL file to CSV.
+
+    Produces two CSV files:
+      <name>_system.csv  — one row per sample (CPU/GPU power, temps, memory)
+      <name>_processes.csv — one row per process per sample
+    """
+    import csv
+    from pathlib import Path
+
+    inpath = Path(args.export)
+    stem = inpath.stem
+    outdir = inpath.parent
+
+    sys_csv_path = outdir / f"{stem}_system.csv"
+    proc_csv_path = outdir / f"{stem}_processes.csv"
+
+    with open(inpath) as f:
+        lines = f.readlines()
+
+    if not lines:
+        print("Empty recording file.", file=sys.stderr)
+        return
+
+    # Parse all records
+    records = [json.loads(line.strip()) for line in lines if line.strip()]
+
+    # --- System CSV ---
+    sys_fields = [
+        "timestamp", "epoch", "interval",
+        "cpu_power_w", "cpu_energy_nj",
+        "ecpu_freq_mhz", "ecpu_active_pct",
+        "pcpu_freq_mhz", "pcpu_active_pct",
+        "gpu_power_w", "gpu_freq_mhz", "gpu_throttled",
+        "temp_cpu_avg", "temp_gpu_avg", "temp_system_avg",
+        "memory_total", "memory_used", "memory_available", "memory_compressed",
+        "gpu_device_utilization", "gpu_model",
+    ]
+    with open(sys_csv_path, "w", newline="") as sf:
+        writer = csv.DictWriter(sf, fieldnames=sys_fields, extrasaction="ignore")
+        writer.writeheader()
+        for r in records:
+            cpu = r.get("cpu", {})
+            gpu = r.get("gpu", {})
+            temps = r.get("temperatures", {})
+            mem = r.get("memory", {})
+            gs = r.get("gpu_stats", {})
+            clusters = cpu.get("clusters", {})
+            ecpu = clusters.get("ECPU", {})
+            pcpu = clusters.get("PCPU", {})
+
+            writer.writerow({
+                "timestamp": r.get("timestamp", ""),
+                "epoch": r.get("epoch", 0),
+                "interval": r.get("interval", 0),
+                "cpu_power_w": cpu.get("cpu_power_w", 0),
+                "cpu_energy_nj": cpu.get("cpu_energy_nj", 0),
+                "ecpu_freq_mhz": ecpu.get("freq_mhz", 0),
+                "ecpu_active_pct": ecpu.get("active_pct", 0),
+                "pcpu_freq_mhz": pcpu.get("freq_mhz", 0),
+                "pcpu_active_pct": pcpu.get("active_pct", 0),
+                "gpu_power_w": gpu.get("gpu_power_w", 0),
+                "gpu_freq_mhz": gpu.get("gpu_freq_mhz", 0),
+                "gpu_throttled": gpu.get("throttled", False),
+                "temp_cpu_avg": temps.get("cpu_avg", 0),
+                "temp_gpu_avg": temps.get("gpu_avg", 0),
+                "temp_system_avg": temps.get("system_avg", 0),
+                "memory_total": mem.get("memory_total", 0),
+                "memory_used": mem.get("memory_used", 0),
+                "memory_available": mem.get("memory_available", 0),
+                "memory_compressed": mem.get("memory_compressed", 0),
+                "gpu_device_utilization": gs.get("device_utilization", 0),
+                "gpu_model": gs.get("model", ""),
+            })
+
+    # --- Process CSV ---
+    proc_fields = [
+        "timestamp", "pid", "name",
+        "gpu_percent", "cpu_percent", "memory_mb", "energy_w", "threads",
+    ]
+    # Check if any record has detailed fields
+    has_detailed = any(
+        "ipc" in p
+        for r in records
+        for p in r.get("processes", [])
+    )
+    if has_detailed:
+        proc_fields += [
+            "peak_memory_mb", "wired_mb", "neural_mb",
+            "disk_read_mb", "disk_write_mb",
+            "instructions", "cycles", "ipc",
+            "idle_wakeups", "pageins",
+        ]
+
+    with open(proc_csv_path, "w", newline="") as pf:
+        writer = csv.DictWriter(pf, fieldnames=proc_fields, extrasaction="ignore")
+        writer.writeheader()
+        for r in records:
+            ts = r.get("timestamp", "")
+            for p in r.get("processes", []):
+                row = {"timestamp": ts, **p}
+                writer.writerow(row)
+
+    print(f"Exported {len(records)} samples:")
+    print(f"  System:    {sys_csv_path}")
+    print(f"  Processes: {proc_csv_path}")
 
 
 def _run_replay(args):
@@ -276,6 +402,10 @@ def main() -> None:
         "--replay", type=str, metavar="FILE",
         help="Replay a recorded JSONL file"
     )
+    parser.add_argument(
+        "--export", type=str, metavar="FILE",
+        help="Export a recorded JSONL file to CSV (produces _system.csv and _processes.csv)"
+    )
     args = parser.parse_args()
 
     # GUI mode
@@ -296,6 +426,11 @@ def main() -> None:
         args.count = 1
 
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    # Export mode (no live data needed)
+    if args.export:
+        _run_export(args)
+        return
 
     # Replay mode
     if args.replay:

@@ -1,28 +1,33 @@
 """darwin-perf: System performance monitoring for macOS Apple Silicon.
 
-GPU, CPU, memory, energy, and disk I/O metrics via Mach kernel APIs
-and IORegistry — the same data sources Activity Monitor uses. No sudo
-or entitlements required.
+GPU, CPU, memory, energy, temperature, and disk I/O metrics via Mach
+kernel APIs, IORegistry, and AppleSMC. No sudo needed.
 
 Quick start::
 
-    from darwin_perf import GpuMonitor
+    from darwin_perf import snapshot
 
-    monitor = GpuMonitor()           # tracks the current process
-    # ... do some GPU work ...
-    print(f"GPU: {monitor.sample():.1f}%")
+    # Per-process GPU/CPU utilization with system context
+    for proc in snapshot():
+        print(f"{proc['name']:20s}  GPU {proc['gpu_percent']:5.1f}%")
 
-System-wide stats (instant, no subprocess)::
+Temperatures (instant, no sudo)::
 
-    from darwin_perf import system_stats
-    s = system_stats()
-    print(f"RAM: {s['memory_used']/1e9:.1f} / {s['memory_total']/1e9:.1f} GB")
-    print(f"CPU: {100 - s['cpu_idle_pct']:.1f}%")
+    from darwin_perf import temperatures
+    t = temperatures()
+    print(f"CPU: {t['cpu_avg']:.1f}°C  GPU: {t['gpu_avg']:.1f}°C")
 
-GPU power and frequency::
+CPU cluster frequency and power::
+
+    from darwin_perf import cpu_power
+    c = cpu_power(0.5)
+    for name, cluster in c['clusters'].items():
+        print(f"{name}: {cluster['freq_mhz']} MHz")
+
+GPU power, frequency, and thermal::
 
     from darwin_perf import gpu_power
-    p = gpu_power(0.1)
+    p = gpu_power(0.5)
     print(f"{p['gpu_power_w']:.1f}W  {p['gpu_freq_mhz']}MHz  throttled={p['throttled']}")
 """
 
@@ -67,7 +72,7 @@ __all__ = [
     "temperatures",
 ]
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 
 def _snapshot() -> dict[int, dict]:
@@ -133,8 +138,9 @@ def snapshot(
     interval: float = 1.0,
     active_only: bool = True,
     detailed: bool = False,
-) -> list[dict]:
-    """One-call GPU utilization snapshot for all processes.
+    system: bool = False,
+) -> list[dict] | dict:
+    """One-call system and process performance snapshot.
 
     Auto-discovers every process using the GPU, measures utilization
     over ``interval`` seconds, and returns ready-to-use results sorted
@@ -145,12 +151,14 @@ def snapshot(
         active_only: If True (default), only return processes with GPU
             activity during the interval. Set to False to include all
             processes that have a GPU client (even if idle).
-        detailed: If True, include extended fields (IPC, wakeups, disk I/O,
-            peak memory, wired memory, neural engine). Default False returns
-            the most commonly needed fields.
+        detailed: If True, include extended process fields (IPC, wakeups,
+            disk I/O, peak memory, wired memory, neural engine).
+        system: If True, return a dict with full system context instead
+            of just the process list. Includes CPU/GPU power, frequencies,
+            temperatures, memory, and per-process data.
 
     Returns:
-        List of dicts sorted by gpu_percent descending. Default fields::
+        Without ``system``: list of dicts sorted by gpu_percent descending::
 
             pid, name, gpu_percent, gpu_ns, cpu_percent, memory_mb,
             energy_w, threads
@@ -160,6 +168,15 @@ def snapshot(
             peak_memory_mb, wired_mb, neural_mb, disk_read_mb, disk_write_mb,
             instructions, cycles, ipc, idle_wakeups, pageins
 
+        With ``system=True``: dict with keys::
+
+            processes: list — same as above
+            cpu: dict — cpu_power_w, cpu_energy_nj, clusters (ECPU/PCPU)
+            gpu: dict — gpu_power_w, gpu_freq_mhz, throttled, frequency_states
+            temperatures: dict — cpu_avg, gpu_avg, system_avg, per-sensor
+            memory: dict — total, used, available, compressed, etc.
+            gpu_stats: dict — device_utilization, model, gpu_core_count, etc.
+
     Example::
 
         from darwin_perf import snapshot
@@ -167,19 +184,67 @@ def snapshot(
         for proc in snapshot():
             print(f"{proc['name']:20s}  GPU {proc['gpu_percent']:5.1f}%  "
                   f"CPU {proc['cpu_percent']:5.1f}%  {proc['memory_mb']:.0f}MB")
+
+        # Full system recording:
+        s = snapshot(system=True)
+        print(f"CPU: {s['cpu']['cpu_power_w']:.1f}W  GPU: {s['gpu']['gpu_power_w']:.1f}W")
+        print(f"Temps: CPU {s['temperatures']['cpu_avg']:.0f}°C")
     """
-    # First sample
+    if system:
+        # Parallel sampling: gpu_power and cpu_power both sleep for interval,
+        # so we run them concurrently with process snapshot collection.
+        import concurrent.futures
+
+        snap1 = _snapshot()
+        info1: dict[int, dict] = {}
+        for pid in snap1:
+            i = proc_info(pid)
+            if i:
+                info1[pid] = i
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            gpu_fut = pool.submit(gpu_power, interval)
+            cpu_fut = pool.submit(cpu_power, interval)
+            # Temperature is instant, read after interval
+            _time.sleep(interval)
+            temps = temperatures()
+
+        gpu_data = gpu_fut.result()
+        cpu_data = cpu_fut.result()
+
+        snap2 = _snapshot()
+        process_list = _build_process_list(
+            snap1, snap2, info1, interval, active_only, detailed,
+        )
+
+        return {
+            "processes": process_list,
+            "cpu": cpu_data,
+            "gpu": gpu_data,
+            "temperatures": temps,
+            "memory": system_stats(),
+            "gpu_stats": system_gpu_stats(),
+        }
+
+    # Non-system mode: original behavior
     snap1 = _snapshot()
-    info1: dict[int, dict] = {}
+    info1 = {}
     for pid in snap1:
-        info = proc_info(pid)
-        if info:
-            info1[pid] = info
+        i = proc_info(pid)
+        if i:
+            info1[pid] = i
 
     _time.sleep(interval)
 
-    # Second sample
     snap2 = _snapshot()
+    return _build_process_list(snap1, snap2, info1, interval, active_only, detailed)
+
+
+def _build_process_list(
+    snap1: dict, snap2: dict, info1: dict,
+    interval: float, active_only: bool, detailed: bool,
+) -> list[dict]:
+    """Build per-process stats from two GPU snapshots."""
     interval_ns = interval * 1_000_000_000
     results = []
     for pid, c2 in snap2.items():
@@ -191,12 +256,10 @@ def snapshot(
         info = proc_info(pid)
         i1 = info1.get(pid)
 
-        # CPU delta
         cpu2 = info["cpu_ns"] if info else 0
         cpu1_val = i1["cpu_ns"] if i1 else cpu2
         cpu_delta = cpu2 - cpu1_val
 
-        # Energy delta
         energy2 = info["energy_nj"] if info else 0
         energy1_val = i1["energy_nj"] if i1 else energy2
         energy_delta = energy2 - energy1_val

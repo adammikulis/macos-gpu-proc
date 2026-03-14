@@ -107,7 +107,7 @@ def test_system_stats_cpu_delta():
     from darwin_perf import system_stats
 
     s1 = system_stats()
-    time.sleep(0.2)
+    time.sleep(0.5)
     s2 = system_stats()
     # Ticks should advance
     assert s2["cpu_ticks_user"] >= s1["cpu_ticks_user"]
@@ -248,6 +248,29 @@ def test_cli_csv_output():
     assert "gpu_pct" in header
 
 
+def test_snapshot_system_mode():
+    from darwin_perf import snapshot
+
+    s = snapshot(interval=0.2, system=True)
+    assert isinstance(s, dict)
+    assert "processes" in s
+    assert "cpu" in s
+    assert "gpu" in s
+    assert "temperatures" in s
+    assert "memory" in s
+    assert "gpu_stats" in s
+    # CPU data
+    assert "cpu_power_w" in s["cpu"]
+    assert "clusters" in s["cpu"]
+    # GPU data
+    assert "gpu_power_w" in s["gpu"]
+    # Temperatures
+    assert "cpu_avg" in s["temperatures"]
+    # Memory
+    assert "memory_total" in s["memory"]
+    assert s["memory"]["memory_total"] > 0
+
+
 def test_record_creates_jsonl(tmp_path):
     import json
     import subprocess
@@ -264,6 +287,59 @@ def test_record_creates_jsonl(tmp_path):
     data = json.loads(content.split("\n")[0])
     assert "timestamp" in data
     assert "processes" in data
+    # Full system recording should include system-level data
+    assert "cpu" in data
+    assert "gpu" in data
+    assert "temperatures" in data
+    assert "memory" in data
+
+
+def test_export_creates_csvs(tmp_path):
+    import json
+    import subprocess
+
+    # Create a fixture JSONL
+    fixture = tmp_path / "fixture.jsonl"
+    record = {
+        "timestamp": "2026-03-14T12:00:00",
+        "epoch": 1773580800.0,
+        "interval": 1.0,
+        "processes": [
+            {"pid": 1, "name": "test", "gpu_percent": 50.0, "cpu_percent": 10.0,
+             "memory_mb": 100.0, "energy_w": 1.5, "threads": 4}
+        ],
+        "cpu": {"cpu_power_w": 5.0, "cpu_energy_nj": 5000000000, "clusters": {
+            "ECPU": {"freq_mhz": 600, "active_pct": 80.0, "frequency_states": []},
+            "PCPU": {"freq_mhz": 1200, "active_pct": 50.0, "frequency_states": []},
+        }},
+        "gpu": {"gpu_power_w": 3.0, "gpu_freq_mhz": 1000, "throttled": False},
+        "temperatures": {"cpu_avg": 45.0, "gpu_avg": 40.0, "system_avg": 35.0,
+                         "cpu_sensors": {}, "gpu_sensors": {}, "system_sensors": {}},
+        "memory": {"memory_total": 137438953472, "memory_used": 50000000000,
+                   "memory_available": 87438953472, "memory_compressed": 1000000000},
+        "gpu_stats": {"device_utilization": 25, "model": "Apple M4 Max"},
+    }
+    fixture.write_text(json.dumps(record) + "\n")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "darwin_perf.cli", "--export", str(fixture)],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0
+
+    sys_csv = tmp_path / "fixture_system.csv"
+    proc_csv = tmp_path / "fixture_processes.csv"
+    assert sys_csv.exists()
+    assert proc_csv.exists()
+
+    sys_lines = sys_csv.read_text().strip().split("\n")
+    assert len(sys_lines) == 2  # header + 1 data row
+    assert "cpu_power_w" in sys_lines[0]
+    assert "5.0" in sys_lines[1]
+
+    proc_lines = proc_csv.read_text().strip().split("\n")
+    assert len(proc_lines) == 2
+    assert "test" in proc_lines[1]
 
 
 def test_replay_reads_jsonl(tmp_path):

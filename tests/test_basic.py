@@ -139,3 +139,153 @@ def test_system_gpu_stats():
     assert "model" in s
     assert "gpu_core_count" in s
     assert s["gpu_core_count"] > 0
+
+
+def test_cpu_power_returns_dict():
+    from darwin_perf import cpu_power
+
+    result = cpu_power(0.1)
+    assert isinstance(result, dict)
+    assert "cpu_power_w" in result
+    assert "cpu_energy_nj" in result
+    assert "clusters" in result
+    assert isinstance(result["cpu_power_w"], float)
+    assert result["cpu_power_w"] >= 0
+    assert isinstance(result["cpu_energy_nj"], int)
+
+
+def test_cpu_power_cluster_states():
+    from darwin_perf import cpu_power
+
+    result = cpu_power(0.1)
+    clusters = result.get("clusters", {})
+    # Should have at least one cluster (ECPU or PCPU)
+    assert len(clusters) >= 1, f"Expected at least 1 cluster, got {list(clusters.keys())}"
+    for name, data in clusters.items():
+        assert name in ("ECPU", "PCPU"), f"Unexpected cluster name: {name}"
+        assert "frequency_states" in data
+        assert "active_pct" in data
+        assert isinstance(data["frequency_states"], list)
+
+
+def test_gpu_clients_has_api_field():
+    from darwin_perf import gpu_clients
+
+    clients = gpu_clients()
+    # gpu_clients may be empty if no GPU activity, but if present, check api
+    for c in clients:
+        assert "api" in c, f"Missing 'api' key in gpu client: {c}"
+        assert isinstance(c["api"], str)
+
+
+def test_gpu_power_expanded_temps():
+    from darwin_perf import gpu_power
+
+    result = gpu_power(0.1)
+    temps = result.get("temperatures", {})
+    assert isinstance(temps, dict)
+    assert "gpu_sensors" in temps
+    assert "cpu_sensors" in temps
+    assert "system_sensors" in temps
+
+
+def test_temperatures_standalone():
+    from darwin_perf import temperatures
+
+    temps = temperatures()
+    assert isinstance(temps, dict)
+    assert "cpu_sensors" in temps
+    assert "gpu_sensors" in temps
+    assert "system_sensors" in temps
+    # Should find at least some sensors on Apple Silicon
+    cpu = temps["cpu_sensors"]
+    gpu = temps["gpu_sensors"]
+    assert len(cpu) > 0 or len(gpu) > 0, "Expected at least one temperature sensor"
+    # Verify values are reasonable temperatures
+    for name, val in cpu.items():
+        assert 0 < val < 150, f"{name} = {val}°C out of range"
+    for name, val in gpu.items():
+        assert 0 < val < 150, f"{name} = {val}°C out of range"
+    # Averages should exist if sensors exist
+    if cpu:
+        assert "cpu_avg" in temps
+        assert 0 < temps["cpu_avg"] < 150
+    if gpu:
+        assert "gpu_avg" in temps
+        assert 0 < temps["gpu_avg"] < 150
+
+
+def test_cli_json_output():
+    import json
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, "-m", "darwin_perf.cli", "--json", "--once", "-i", "0.5"],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0
+    # Should produce at least one JSON line
+    lines = [l for l in result.stdout.strip().split("\n") if l]
+    assert len(lines) >= 1
+    data = json.loads(lines[0])
+    assert "timestamp" in data
+    assert "processes" in data
+
+
+def test_cli_csv_output():
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, "-m", "darwin_perf.cli", "--csv", "--once", "-i", "0.5"],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0
+    lines = result.stdout.strip().split("\n")
+    assert len(lines) >= 1
+    header = lines[0]
+    assert "timestamp" in header
+    assert "pid" in header
+    assert "gpu_pct" in header
+
+
+def test_record_creates_jsonl(tmp_path):
+    import json
+    import subprocess
+
+    outfile = tmp_path / "test_record.jsonl"
+    result = subprocess.run(
+        [sys.executable, "-m", "darwin_perf.cli", "--record", str(outfile), "--once", "-i", "0.5"],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0
+    assert outfile.exists()
+    content = outfile.read_text().strip()
+    assert len(content) > 0
+    data = json.loads(content.split("\n")[0])
+    assert "timestamp" in data
+    assert "processes" in data
+
+
+def test_replay_reads_jsonl(tmp_path):
+    import json
+    import subprocess
+
+    # Create a fixture JSONL file
+    fixture = tmp_path / "fixture.jsonl"
+    record = {
+        "timestamp": "2026-03-14T12:00:00+0000",
+        "epoch": 1773580800.0,
+        "interval": 1.0,
+        "processes": [
+            {"pid": 1, "name": "test", "gpu_percent": 50.0, "cpu_percent": 10.0, "memory_mb": 100.0}
+        ],
+    }
+    fixture.write_text(json.dumps(record) + "\n")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "darwin_perf.cli", "--replay", str(fixture), "--once"],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0
+    assert "test" in result.stdout
+    assert "replay" in result.stdout

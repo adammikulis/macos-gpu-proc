@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darwin-perf"
-version = "0.2.1"
-description = "System performance monitoring for macOS Apple Silicon — GPU, CPU, memory, energy, disk I/O via Mach APIs. No sudo needed."
+version = "0.3.1"
+description = "System performance monitoring for macOS Apple Silicon — GPU, CPU, memory, energy, temperature, disk I/O via Mach APIs and AppleSMC. No sudo needed."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"

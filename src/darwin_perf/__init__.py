@@ -34,6 +34,7 @@ import time as _time
 from typing import Any
 
 from ._native import (
+    cpu_power,
     cpu_time_ns,
     gpu_clients,
     gpu_freq_table,
@@ -44,10 +45,12 @@ from ._native import (
     proc_info,
     system_gpu_stats,
     system_stats,
+    temperatures,
 )
 
 __all__ = [
     "GpuMonitor",
+    "cpu_power",
     "cpu_time_ns",
     "gpu_clients",
     "gpu_freq_table",
@@ -61,21 +64,22 @@ __all__ = [
     "snapshot",
     "system_gpu_stats",
     "system_stats",
+    "temperatures",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.3.1"
 
 
 def _snapshot() -> dict[int, dict]:
     """Take a snapshot of all GPU clients aggregated by PID.
 
-    Returns dict: pid -> {'name': str, 'gpu_ns': int}
+    Returns dict: pid -> {'name': str, 'gpu_ns': int, 'api': str}
     """
     by_pid: dict[int, dict] = {}
     for c in gpu_clients():
         pid = c["pid"]
         if pid not in by_pid:
-            by_pid[pid] = {"name": c["name"], "gpu_ns": 0}
+            by_pid[pid] = {"name": c["name"], "gpu_ns": 0, "api": c.get("api", "unknown")}
         by_pid[pid]["gpu_ns"] += c["gpu_ns"]
     return by_pid
 

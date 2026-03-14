@@ -87,11 +87,33 @@ static long long sum_app_usage_gpu_time(CFArrayRef app_usage) {
 /* ------------------------------------------------------------------ */
 
 /**
+ * Extract the API name (e.g. "Metal", "GL", "CL") from the first
+ * AppUsage entry that has an "API" CFString key.
+ * Writes into out_api (up to api_size bytes). Returns 0 on success.
+ */
+static int extract_api_name(CFArrayRef app_usage, char *out_api, size_t api_size) {
+    if (!app_usage) return -1;
+    CFIndex count = CFArrayGetCount(app_usage);
+    for (CFIndex i = 0; i < count; i++) {
+        CFDictionaryRef entry = CFArrayGetValueAtIndex(app_usage, i);
+        if (!entry || CFGetTypeID(entry) != CFDictionaryGetTypeID())
+            continue;
+        CFStringRef api = CFDictionaryGetValue(entry, CFSTR("API"));
+        if (api && CFGetTypeID(api) == CFStringGetTypeID()) {
+            if (CFStringGetCString(api, out_api, api_size, kCFStringEncodingUTF8))
+                return 0;
+        }
+    }
+    return -1;
+}
+
+/**
  * Result struct for one GPU client.
  */
 typedef struct {
     int pid;
     char name[128];
+    char api[16];
     long long gpu_ns;
 } gpu_client_t;
 
@@ -177,6 +199,9 @@ static int read_gpu_clients(gpu_client_t **out_clients) {
             clients[count].pid = pid;
             clients[count].gpu_ns = gpu_ns;
             parse_creator_name(creator, clients[count].name, sizeof(clients[count].name));
+            clients[count].api[0] = '\0';
+            if (app_usage)
+                extract_api_name(app_usage, clients[count].api, sizeof(clients[count].api));
             count++;
 
             if (app_usage) CFRelease(app_usage);
@@ -322,14 +347,18 @@ static PyObject* py_gpu_clients(PyObject* self, PyObject* args) {
         PyObject* pid_obj = PyLong_FromLong(clients[i].pid);
         PyObject* name_obj = PyUnicode_FromString(clients[i].name);
         PyObject* ns_obj = PyLong_FromLongLong(clients[i].gpu_ns);
+        PyObject* api_obj = PyUnicode_FromString(
+            clients[i].api[0] ? clients[i].api : "unknown");
 
         PyDict_SetItemString(d, "pid", pid_obj);
         PyDict_SetItemString(d, "name", name_obj);
         PyDict_SetItemString(d, "gpu_ns", ns_obj);
+        PyDict_SetItemString(d, "api", api_obj);
 
         Py_DECREF(pid_obj);
         Py_DECREF(name_obj);
         Py_DECREF(ns_obj);
+        Py_DECREF(api_obj);
 
         PyList_SET_ITEM(list, i, d);  /* steals ref */
     }
@@ -782,6 +811,9 @@ static PyObject* cfstr_to_pystr(CFStringRef cf) {
 }
 
 
+/* Forward declaration — defined below, after system_stats */
+static PyObject* py_temperatures(PyObject* self, PyObject* args);
+
 PyDoc_STRVAR(gpu_power_doc,
 "gpu_power(interval=1.0) -> dict\n\n"
 "Sample GPU power, temperature, and frequency state via IOReport.\n\n"
@@ -837,6 +869,7 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
         if (channels) CFRelease(channels);
         CFRelease(energy_group);
         CFRelease(gpu_group);
+
         return PyDict_New();
     }
 
@@ -855,6 +888,7 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
         CFRelease(channels);
         CFRelease(energy_group);
         CFRelease(gpu_group);
+
         return PyDict_New();
     }
 
@@ -870,6 +904,7 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
         CFRelease(channels);
         CFRelease(energy_group);
         CFRelease(gpu_group);
+
         return NULL;
     }
 
@@ -917,81 +952,111 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
     channel_pair_t *pairs = malloc(MAX_CHANNELS * sizeof(channel_pair_t));
     int n_pairs = 0;
 
-    /* Extract channels from the nested IOReportDrivers structure */
+    /* Extract channel pairs from two IOReport samples.
+     * Sample structure varies: the first value can be a dict of drivers
+     * (each containing an IOReportChannels array) or a flat array of channels.
+     * We handle both by collecting channels into pairs[]. */
     {
-        /* Get IOReportDrivers dict (first value in the sample dict) */
         CFIndex sn = CFDictionaryGetCount(s1_keep);
         CFIndex sn2 = CFDictionaryGetCount(s2);
         if (sn > 0 && sn2 > 0) {
-            const void *sk1[4], *sv1[4], *sk2[4], *sv2[4];
+            const void **sk1 = malloc(sn * sizeof(void*));
+            const void **sv1 = malloc(sn * sizeof(void*));
+            const void **sk2 = malloc(sn2 * sizeof(void*));
+            const void **sv2 = malloc(sn2 * sizeof(void*));
             CFDictionaryGetKeysAndValues(s1_keep, sk1, sv1);
             CFDictionaryGetKeysAndValues(s2, sk2, sv2);
 
-            /* First value should be the IOReportDrivers dict */
-            CFDictionaryRef drivers1 = (CFGetTypeID(sv1[0]) == CFDictionaryGetTypeID())
-                ? (CFDictionaryRef)sv1[0] : NULL;
-            CFDictionaryRef drivers2 = (CFGetTypeID(sv2[0]) == CFDictionaryGetTypeID())
-                ? (CFDictionaryRef)sv2[0] : NULL;
+            /* Try all top-level values for dict (drivers) or array (flat channels) */
+            for (CFIndex tv = 0; tv < sn2 && n_pairs < MAX_CHANNELS; tv++) {
+                CFTypeID vtype = CFGetTypeID(sv2[tv]);
 
-            if (drivers1 && drivers2) {
-                /* Iterate driver dicts in drivers2 */
-                CFIndex nd = CFDictionaryGetCount(drivers2);
-                const void **dk = malloc(nd * sizeof(void*));
-                const void **dv = malloc(nd * sizeof(void*));
-                CFDictionaryGetKeysAndValues(drivers2, dk, dv);
-
-                for (CFIndex d = 0; d < nd; d++) {
-                    if (CFGetTypeID(dv[d]) != CFDictionaryGetTypeID()) continue;
-                    CFDictionaryRef drv2 = (CFDictionaryRef)dv[d];
-                    /* Get matching driver from s1 */
-                    CFDictionaryRef drv1 = (CFDictionaryRef)CFDictionaryGetValue(drivers1, dk[d]);
-
-                    /* Find IOReportChannels array in this driver */
-                    CFIndex dnk = CFDictionaryGetCount(drv2);
-                    const void **ddk = malloc(dnk * sizeof(void*));
-                    const void **ddv = malloc(dnk * sizeof(void*));
-                    CFDictionaryGetKeysAndValues(drv2, ddk, ddv);
-
-                    CFArrayRef ch_arr2 = NULL, ch_arr1 = NULL;
-                    for (CFIndex k = 0; k < dnk; k++) {
-                        if (CFGetTypeID(ddv[k]) == CFArrayGetTypeID()) {
-                            ch_arr2 = (CFArrayRef)ddv[k];
-                            /* Find matching array in drv1 */
-                            if (drv1 && CFGetTypeID(drv1) == CFDictionaryGetTypeID()) {
-                                CFTypeRef v1 = CFDictionaryGetValue(drv1, ddk[k]);
-                                if (v1 && CFGetTypeID(v1) == CFArrayGetTypeID())
-                                    ch_arr1 = (CFArrayRef)v1;
-                            }
+                if (vtype == CFArrayGetTypeID()) {
+                    /* Flat array of channels — find matching array in s1 */
+                    CFArrayRef arr2 = (CFArrayRef)sv2[tv];
+                    CFArrayRef arr1 = NULL;
+                    /* Find matching key in s1 */
+                    for (CFIndex j = 0; j < sn; j++) {
+                        if (CFEqual(sk1[j], sk2[tv]) && CFGetTypeID(sv1[j]) == CFArrayGetTypeID()) {
+                            arr1 = (CFArrayRef)sv1[j];
                             break;
                         }
                     }
-                    free(ddk);
-                    free(ddv);
-
-                    if (ch_arr2 && ch_arr1) {
-                        CFIndex nc = CFArrayGetCount(ch_arr2);
-                        CFIndex nc1 = CFArrayGetCount(ch_arr1);
+                    if (arr1) {
+                        CFIndex nc = CFArrayGetCount(arr2);
+                        CFIndex nc1 = CFArrayGetCount(arr1);
                         if (nc1 < nc) nc = nc1;
                         for (CFIndex c = 0; c < nc && n_pairs < MAX_CHANNELS; c++) {
-                            pairs[n_pairs].ch = CFArrayGetValueAtIndex(ch_arr2, c);
-                            pairs[n_pairs].ch1 = CFArrayGetValueAtIndex(ch_arr1, c);
+                            pairs[n_pairs].ch = CFArrayGetValueAtIndex(arr2, c);
+                            pairs[n_pairs].ch1 = CFArrayGetValueAtIndex(arr1, c);
                             n_pairs++;
                         }
                     }
+                } else if (vtype == CFDictionaryGetTypeID()) {
+                    /* Nested dict of drivers — original structure */
+                    CFDictionaryRef drivers2 = (CFDictionaryRef)sv2[tv];
+                    CFDictionaryRef drivers1 = NULL;
+                    for (CFIndex j = 0; j < sn; j++) {
+                        if (CFEqual(sk1[j], sk2[tv]) && CFGetTypeID(sv1[j]) == CFDictionaryGetTypeID()) {
+                            drivers1 = (CFDictionaryRef)sv1[j];
+                            break;
+                        }
+                    }
+                    if (!drivers1) continue;
+
+                    CFIndex nd = CFDictionaryGetCount(drivers2);
+                    const void **dk = malloc(nd * sizeof(void*));
+                    const void **dv = malloc(nd * sizeof(void*));
+                    CFDictionaryGetKeysAndValues(drivers2, dk, dv);
+
+                    for (CFIndex d = 0; d < nd; d++) {
+                        if (CFGetTypeID(dv[d]) != CFDictionaryGetTypeID()) continue;
+                        CFDictionaryRef drv2 = (CFDictionaryRef)dv[d];
+                        CFDictionaryRef drv1 = (CFDictionaryRef)CFDictionaryGetValue(drivers1, dk[d]);
+
+                        CFIndex dnk = CFDictionaryGetCount(drv2);
+                        const void **ddk = malloc(dnk * sizeof(void*));
+                        const void **ddv = malloc(dnk * sizeof(void*));
+                        CFDictionaryGetKeysAndValues(drv2, ddk, ddv);
+
+                        CFArrayRef ch_arr2 = NULL, ch_arr1 = NULL;
+                        for (CFIndex k = 0; k < dnk; k++) {
+                            if (CFGetTypeID(ddv[k]) == CFArrayGetTypeID()) {
+                                ch_arr2 = (CFArrayRef)ddv[k];
+                                if (drv1 && CFGetTypeID(drv1) == CFDictionaryGetTypeID()) {
+                                    CFTypeRef v1 = CFDictionaryGetValue(drv1, ddk[k]);
+                                    if (v1 && CFGetTypeID(v1) == CFArrayGetTypeID())
+                                        ch_arr1 = (CFArrayRef)v1;
+                                }
+                                break;
+                            }
+                        }
+                        free(ddk);
+                        free(ddv);
+
+                        if (ch_arr2 && ch_arr1) {
+                            CFIndex nc = CFArrayGetCount(ch_arr2);
+                            CFIndex nc1 = CFArrayGetCount(ch_arr1);
+                            if (nc1 < nc) nc = nc1;
+                            for (CFIndex c = 0; c < nc && n_pairs < MAX_CHANNELS; c++) {
+                                pairs[n_pairs].ch = CFArrayGetValueAtIndex(ch_arr2, c);
+                                pairs[n_pairs].ch1 = CFArrayGetValueAtIndex(ch_arr1, c);
+                                n_pairs++;
+                            }
+                        }
+                    }
+                    free(dk);
+                    free(dv);
                 }
-                free(dk);
-                free(dv);
             }
+
+            free(sk1); free(sv1);
+            free(sk2); free(sv2);
         }
     }
 
     /* Also collect abs_arr for temperatures from s2 pairs */
 
-    /* Temps dict and sensors sub-dict */
-    PyObject *temps_dict = PyDict_New();
-    PyObject *sensors_dict = PyDict_New();
-    long long temp_sum = 0;
-    int temp_count = 0;
 
     /* Frequency states list */
     PyObject *freq_list = PyList_New(0);
@@ -1186,61 +1251,14 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
         }
     }
 
-    /* Parse temperatures from "TgXa Max" channels (absolute from s2).
-     * IOReport provides Sum, Sum Count, Min, Max per sensor.
-     * We use "Max" as the instantaneous reading. */
+    /* Read temperatures via AppleSMC (instant, no IOReport) */
     {
-        for (int i = 0; i < n_pairs; i++) {
-            CFDictionaryRef entry = pairs[i].ch;
-            CFStringRef name = ior_ChannelGetChannelName(entry);
-            int32_t fmt = ior_ChannelGetFormat(entry);
-
-            if (!name || fmt != kIOReportFormatSimple) continue;
-
-            char name_buf[128];
-            if (!CFStringGetCString(name, name_buf, sizeof(name_buf), kCFStringEncodingUTF8))
-                continue;
-
-            /* Match "TgXXa Max" pattern */
-            if (strncmp(name_buf, "Tg", 2) != 0) continue;
-            size_t nlen = strlen(name_buf);
-            /* Check for " Max" suffix */
-            if (nlen < 7) continue;
-            if (strcmp(name_buf + nlen - 4, " Max") != 0) continue;
-            name_buf[nlen - 4] = '\0';  /* truncate " Max" */
-
-            int64_t raw = ior_SimpleGetIntegerValue(entry, NULL);
-            /* Temperature value scale depends on kernel version.
-             * Values >10000 are likely milli-degrees, >1000 centi-degrees. */
-            double temp_c;
-            if (raw > 100000)
-                temp_c = (double)raw / 1000.0;  /* milli-degrees */
-            else if (raw > 10000)
-                temp_c = (double)raw / 100.0;   /* centi-degrees */
-            else
-                temp_c = (double)raw;            /* already Celsius */
-
-            if (temp_c > 0 && temp_c < 200) {
-                PyObject *v = PyFloat_FromDouble(temp_c);
-                PyDict_SetItemString(sensors_dict, name_buf, v);
-                Py_DECREF(v);
-                temp_sum += (long long)(temp_c * 100);
-                temp_count++;
-            }
+        PyObject *temps = py_temperatures(NULL, NULL);
+        if (temps) {
+            PyDict_SetItemString(result, "temperatures", temps);
+            Py_DECREF(temps);
         }
     }
-
-    /* Add temperature data */
-    if (temp_count > 0) {
-        double avg = (double)temp_sum / (temp_count * 100);
-        PyObject *v = PyFloat_FromDouble(avg);
-        PyDict_SetItemString(temps_dict, "avg", v);
-        Py_DECREF(v);
-    }
-    PyDict_SetItemString(temps_dict, "sensors", sensors_dict);
-    Py_DECREF(sensors_dict);
-    PyDict_SetItemString(result, "temperatures", temps_dict);
-    Py_DECREF(temps_dict);
 
     /* Add frequency states */
     PyDict_SetItemString(result, "frequency_states", freq_list);
@@ -1253,6 +1271,209 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
     CFRelease(channels);
     CFRelease(energy_group);
     CFRelease(gpu_group);
+
+    return result;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* temperatures() — read thermal sensors via AppleSMC                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * SMC data structures. The SMC uses IOConnectCallStructMethod with
+ * selector 2 (kSMCHandleYPCEvent) and data8 values:
+ *   5 = kSMCReadKey, 9 = kSMCGetKeyInfo
+ */
+typedef struct {
+    char     major;
+    char     minor;
+    char     build;
+    char     reserved[1];
+    uint16_t release;
+} smc_vers_t;
+
+typedef struct {
+    uint16_t version;
+    uint16_t length;
+    uint32_t cpuPLimit;
+    uint32_t gpuPLimit;
+    uint32_t memPLimit;
+} smc_plimit_t;
+
+typedef struct {
+    uint32_t dataSize;
+    uint32_t dataType;
+    char     dataAttributes;
+} smc_keyinfo_t;
+
+typedef struct {
+    uint32_t     key;
+    smc_vers_t   vers;
+    smc_plimit_t pLimitData;
+    smc_keyinfo_t keyInfo;
+    uint8_t      result;
+    uint8_t      status;
+    uint8_t      data8;
+    uint32_t     data32;
+    char         bytes[32];
+} smc_keydata_t;
+
+/**
+ * Read a single SMC key's float value. Returns temperature in °C,
+ * or -1.0 on failure. Handles 'flt ' (float32) and 2-byte sp78 formats.
+ */
+static double smc_read_temp(io_connect_t conn, const char *key_str) {
+    smc_keydata_t inp = {0}, out = {0};
+    inp.key = ((uint32_t)key_str[0] << 24) | ((uint32_t)key_str[1] << 16) |
+              ((uint32_t)key_str[2] << 8)  |  (uint32_t)key_str[3];
+    inp.data8 = 9;  /* kSMCGetKeyInfo */
+
+    size_t out_size = sizeof(smc_keydata_t);
+    kern_return_t kr = IOConnectCallStructMethod(
+        conn, 2, &inp, sizeof(inp), &out, &out_size);
+    if (kr != KERN_SUCCESS || out.keyInfo.dataSize == 0)
+        return -1.0;
+
+    smc_keydata_t inp2 = {0}, out2 = {0};
+    inp2.key = inp.key;
+    inp2.keyInfo = out.keyInfo;
+    inp2.data8 = 5;  /* kSMCReadKey */
+
+    out_size = sizeof(smc_keydata_t);
+    kr = IOConnectCallStructMethod(
+        conn, 2, &inp2, sizeof(inp2), &out2, &out_size);
+    if (kr != KERN_SUCCESS)
+        return -1.0;
+
+    uint32_t size = out.keyInfo.dataSize;
+    uint32_t type = out.keyInfo.dataType;
+
+    if (type == 0x666c7420 && size == 4) {  /* "flt " */
+        float val;
+        memcpy(&val, out2.bytes, 4);
+        return (double)val;
+    }
+    if (size == 2) {  /* sp78: signed 8.8 fixed point */
+        int16_t raw = ((uint8_t)out2.bytes[0] << 8) | (uint8_t)out2.bytes[1];
+        return raw / 256.0;
+    }
+    return -1.0;
+}
+
+PyDoc_STRVAR(temperatures_doc,
+"temperatures() -> dict\n\n"
+"Read thermal sensor temperatures via AppleSMC. No sudo needed.\n\n"
+"Returns dict with keys:\n"
+"    - 'cpu_avg': float — average CPU die temperature in °C\n"
+"    - 'gpu_avg': float — average GPU die temperature in °C\n"
+"    - 'system_avg': float — average system/SoC temperature in °C\n"
+"    - 'cpu_sensors': dict — individual CPU sensors {name: °C}\n"
+"    - 'gpu_sensors': dict — individual GPU sensors {name: °C}\n"
+"    - 'system_sensors': dict — individual system sensors {name: °C}\n\n"
+"Sensor naming: Tp* = CPU, Tg* = GPU, Ts* = system.\n"
+"Returns empty dict if AppleSMC is not available.");
+
+static PyObject* py_temperatures(PyObject* self, PyObject* args) {
+    (void)self; (void)args;
+
+    /* Open AppleSMC connection */
+    io_iterator_t iter;
+    kern_return_t kr = IOServiceGetMatchingServices(
+        kIOMainPortDefault, IOServiceMatching("AppleSMC"), &iter);
+    if (kr != KERN_SUCCESS)
+        return PyDict_New();
+
+    io_service_t svc = IOIteratorNext(iter);
+    IOObjectRelease(iter);
+    if (!svc)
+        return PyDict_New();
+
+    io_connect_t conn;
+    kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+    IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS)
+        return PyDict_New();
+
+    PyObject *result = PyDict_New();
+    PyObject *cpu_sensors = PyDict_New();
+    PyObject *gpu_sensors = PyDict_New();
+    PyObject *sys_sensors = PyDict_New();
+    double cpu_sum = 0, gpu_sum = 0, sys_sum = 0;
+    int cpu_count = 0, gpu_count = 0, sys_count = 0;
+
+    /* Scan known temperature key patterns */
+    /* Suffixes: 00-99, 0a-0f, 0P, 0S, 0D, 0H, 0J */
+    const char prefixes[][3] = {"Tp", "Tg", "Ts"};
+    char key[5] = {0};
+
+    for (int p = 0; p < 3; p++) {
+        key[0] = prefixes[p][0];
+        key[1] = prefixes[p][1];
+
+        /* Numeric 00-99 */
+        for (int hi = '0'; hi <= '9'; hi++) {
+            for (int lo = '0'; lo <= '9'; lo++) {
+                key[2] = hi; key[3] = lo;
+                double t = smc_read_temp(conn, key);
+                if (t <= 0 || t >= 150) continue;
+
+                PyObject *v = PyFloat_FromDouble(t);
+                if (p == 0) { PyDict_SetItemString(cpu_sensors, key, v); cpu_sum += t; cpu_count++; }
+                else if (p == 1) { PyDict_SetItemString(gpu_sensors, key, v); gpu_sum += t; gpu_count++; }
+                else { PyDict_SetItemString(sys_sensors, key, v); sys_sum += t; sys_count++; }
+                Py_DECREF(v);
+            }
+        }
+
+        /* Hex suffixes 0a-0f */
+        for (int lo = 'a'; lo <= 'f'; lo++) {
+            key[2] = '0'; key[3] = lo;
+            double t = smc_read_temp(conn, key);
+            if (t <= 0 || t >= 150) continue;
+
+            PyObject *v = PyFloat_FromDouble(t);
+            if (p == 0) { PyDict_SetItemString(cpu_sensors, key, v); cpu_sum += t; cpu_count++; }
+            else if (p == 1) { PyDict_SetItemString(gpu_sensors, key, v); gpu_sum += t; gpu_count++; }
+            else { PyDict_SetItemString(sys_sensors, key, v); sys_sum += t; sys_count++; }
+            Py_DECREF(v);
+        }
+
+        /* Special suffixes */
+        const char *specials[] = {"0P", "0S", "0D", "0H", "0J", "1P", NULL};
+        for (int s = 0; specials[s]; s++) {
+            key[2] = specials[s][0]; key[3] = specials[s][1];
+            double t = smc_read_temp(conn, key);
+            if (t <= 0 || t >= 150) continue;
+
+            PyObject *v = PyFloat_FromDouble(t);
+            if (p == 0) { PyDict_SetItemString(cpu_sensors, key, v); cpu_sum += t; cpu_count++; }
+            else if (p == 1) { PyDict_SetItemString(gpu_sensors, key, v); gpu_sum += t; gpu_count++; }
+            else { PyDict_SetItemString(sys_sensors, key, v); sys_sum += t; sys_count++; }
+            Py_DECREF(v);
+        }
+    }
+
+    IOServiceClose(conn);
+
+    /* Build result */
+    PyObject *v;
+    if (cpu_count > 0) {
+        v = PyFloat_FromDouble(cpu_sum / cpu_count);
+        PyDict_SetItemString(result, "cpu_avg", v); Py_DECREF(v);
+    }
+    if (gpu_count > 0) {
+        v = PyFloat_FromDouble(gpu_sum / gpu_count);
+        PyDict_SetItemString(result, "gpu_avg", v); Py_DECREF(v);
+    }
+    if (sys_count > 0) {
+        v = PyFloat_FromDouble(sys_sum / sys_count);
+        PyDict_SetItemString(result, "system_avg", v); Py_DECREF(v);
+    }
+
+    PyDict_SetItemString(result, "cpu_sensors", cpu_sensors); Py_DECREF(cpu_sensors);
+    PyDict_SetItemString(result, "gpu_sensors", gpu_sensors); Py_DECREF(gpu_sensors);
+    PyDict_SetItemString(result, "system_sensors", sys_sensors); Py_DECREF(sys_sensors);
 
     return result;
 }
@@ -1369,6 +1590,442 @@ static PyObject* py_system_stats(PyObject* self, PyObject* args) {
 
 
 /* ------------------------------------------------------------------ */
+/* CPU power/frequency/residency via libIOReport                       */
+/* ------------------------------------------------------------------ */
+
+PyDoc_STRVAR(cpu_power_doc,
+"cpu_power(interval=1.0) -> dict\n\n"
+"Sample CPU power, frequency, and per-cluster P-state residency via IOReport.\n\n"
+"Takes two IOReport samples separated by ``interval`` seconds and\n"
+"returns the delta. No sudo or special privileges needed.\n\n"
+"Args:\n"
+"    interval: Sampling interval in seconds (default 1.0).\n\n"
+"Returns dict with keys:\n"
+"    - 'cpu_power_w': float — CPU package power in watts\n"
+"    - 'cpu_energy_nj': int — CPU energy delta in nanojoules\n"
+"    - 'clusters': dict — per-cluster frequency state data\n"
+"        e.g. {'ECPU': {'freq_mhz': 1020, 'frequency_states': [...], 'active_pct': 85.2}, ...}\n\n"
+"Returns empty dict if libIOReport is unavailable.");
+
+static PyObject* py_cpu_power(PyObject* self, PyObject* args) {
+    double interval = 1.0;
+    if (!PyArg_ParseTuple(args, "|d", &interval))
+        return NULL;
+
+    if (load_ioreport() < 0)
+        return PyDict_New();
+
+    /* Get channels for Energy Model + CPU Stats */
+    CFStringRef energy_group = CFStringCreateWithCString(kCFAllocatorDefault,
+        "Energy Model", kCFStringEncodingUTF8);
+    CFStringRef cpu_group = CFStringCreateWithCString(kCFAllocatorDefault,
+        "CPU Stats", kCFStringEncodingUTF8);
+
+    CFMutableDictionaryRef channels = (CFMutableDictionaryRef)
+        ior_CopyChannelsInGroup(energy_group, NULL);
+    CFDictionaryRef cpu_channels = ior_CopyChannelsInGroup(cpu_group, NULL);
+
+    if (!channels || !cpu_channels) {
+        if (channels) CFRelease(channels);
+        if (cpu_channels) CFRelease(cpu_channels);
+        CFRelease(energy_group);
+        CFRelease(cpu_group);
+        return PyDict_New();
+    }
+
+    ior_MergeChannels(channels, cpu_channels, NULL);
+    CFRelease(cpu_channels);
+
+    /* Subscribe and take two samples */
+    CFMutableDictionaryRef subbed = NULL;
+    CFTypeRef sub = ior_CreateSubscription(NULL, channels, &subbed, 0, NULL);
+    if (!sub || !subbed) {
+        CFRelease(channels);
+        CFRelease(energy_group);
+        CFRelease(cpu_group);
+        return PyDict_New();
+    }
+
+    CFDictionaryRef s1 = ior_CreateSamples(sub, subbed, NULL);
+
+    Py_BEGIN_ALLOW_THREADS
+    usleep((useconds_t)(interval * 1e6));
+    Py_END_ALLOW_THREADS
+
+    CFDictionaryRef s2 = ior_CreateSamples(sub, subbed, NULL);
+
+    if (!s1 || !s2) {
+        if (s1) CFRelease(s1);
+        if (s2) CFRelease(s2);
+        CFRelease(channels);
+        CFRelease(energy_group);
+        CFRelease(cpu_group);
+        return PyDict_New();
+    }
+
+    PyObject *result = PyDict_New();
+    if (!result) {
+        CFRelease(s1);
+        CFRelease(s2);
+        CFRelease(channels);
+        CFRelease(energy_group);
+        CFRelease(cpu_group);
+        return NULL;
+    }
+
+    /* Extract channel pairs (same pattern as gpu_power) */
+    typedef struct {
+        CFDictionaryRef ch;
+        CFDictionaryRef ch1;
+    } cpu_ch_pair_t;
+
+    cpu_ch_pair_t *pairs = malloc(MAX_CHANNELS * sizeof(cpu_ch_pair_t));
+    int n_pairs = 0;
+
+    {
+        CFIndex sn = CFDictionaryGetCount(s1);
+        CFIndex sn2 = CFDictionaryGetCount(s2);
+        if (sn > 0 && sn2 > 0) {
+            const void **sk1 = malloc(sn * sizeof(void*));
+            const void **sv1 = malloc(sn * sizeof(void*));
+            const void **sk2 = malloc(sn2 * sizeof(void*));
+            const void **sv2 = malloc(sn2 * sizeof(void*));
+            CFDictionaryGetKeysAndValues(s1, sk1, sv1);
+            CFDictionaryGetKeysAndValues(s2, sk2, sv2);
+
+            for (CFIndex tv = 0; tv < sn2 && n_pairs < MAX_CHANNELS; tv++) {
+                CFTypeID vtype = CFGetTypeID(sv2[tv]);
+
+                if (vtype == CFArrayGetTypeID()) {
+                    CFArrayRef arr2 = (CFArrayRef)sv2[tv];
+                    CFArrayRef arr1 = NULL;
+                    for (CFIndex j = 0; j < sn; j++) {
+                        if (CFEqual(sk1[j], sk2[tv]) && CFGetTypeID(sv1[j]) == CFArrayGetTypeID()) {
+                            arr1 = (CFArrayRef)sv1[j];
+                            break;
+                        }
+                    }
+                    if (arr1) {
+                        CFIndex nc = CFArrayGetCount(arr2);
+                        CFIndex nc1 = CFArrayGetCount(arr1);
+                        if (nc1 < nc) nc = nc1;
+                        for (CFIndex c = 0; c < nc && n_pairs < MAX_CHANNELS; c++) {
+                            pairs[n_pairs].ch = CFArrayGetValueAtIndex(arr2, c);
+                            pairs[n_pairs].ch1 = CFArrayGetValueAtIndex(arr1, c);
+                            n_pairs++;
+                        }
+                    }
+                } else if (vtype == CFDictionaryGetTypeID()) {
+                    CFDictionaryRef drivers2 = (CFDictionaryRef)sv2[tv];
+                    CFDictionaryRef drivers1 = NULL;
+                    for (CFIndex j = 0; j < sn; j++) {
+                        if (CFEqual(sk1[j], sk2[tv]) && CFGetTypeID(sv1[j]) == CFDictionaryGetTypeID()) {
+                            drivers1 = (CFDictionaryRef)sv1[j];
+                            break;
+                        }
+                    }
+                    if (!drivers1) continue;
+
+                    CFIndex nd = CFDictionaryGetCount(drivers2);
+                    const void **dk = malloc(nd * sizeof(void*));
+                    const void **dv = malloc(nd * sizeof(void*));
+                    CFDictionaryGetKeysAndValues(drivers2, dk, dv);
+
+                    for (CFIndex d = 0; d < nd; d++) {
+                        if (CFGetTypeID(dv[d]) != CFDictionaryGetTypeID()) continue;
+                        CFDictionaryRef drv2 = (CFDictionaryRef)dv[d];
+                        CFDictionaryRef drv1 = (CFDictionaryRef)CFDictionaryGetValue(drivers1, dk[d]);
+
+                        CFIndex dnk = CFDictionaryGetCount(drv2);
+                        const void **ddk = malloc(dnk * sizeof(void*));
+                        const void **ddv = malloc(dnk * sizeof(void*));
+                        CFDictionaryGetKeysAndValues(drv2, ddk, ddv);
+
+                        CFArrayRef ch_arr2 = NULL, ch_arr1 = NULL;
+                        for (CFIndex k = 0; k < dnk; k++) {
+                            if (CFGetTypeID(ddv[k]) == CFArrayGetTypeID()) {
+                                ch_arr2 = (CFArrayRef)ddv[k];
+                                if (drv1 && CFGetTypeID(drv1) == CFDictionaryGetTypeID()) {
+                                    CFTypeRef v1 = CFDictionaryGetValue(drv1, ddk[k]);
+                                    if (v1 && CFGetTypeID(v1) == CFArrayGetTypeID())
+                                        ch_arr1 = (CFArrayRef)v1;
+                                }
+                                break;
+                            }
+                        }
+                        free(ddk);
+                        free(ddv);
+
+                        if (ch_arr2 && ch_arr1) {
+                            CFIndex nc = CFArrayGetCount(ch_arr2);
+                            CFIndex nc1 = CFArrayGetCount(ch_arr1);
+                            if (nc1 < nc) nc = nc1;
+                            for (CFIndex c = 0; c < nc && n_pairs < MAX_CHANNELS; c++) {
+                                pairs[n_pairs].ch = CFArrayGetValueAtIndex(ch_arr2, c);
+                                pairs[n_pairs].ch1 = CFArrayGetValueAtIndex(ch_arr1, c);
+                                n_pairs++;
+                            }
+                        }
+                    }
+                    free(dk);
+                    free(dv);
+                }
+            }
+
+            free(sk1); free(sv1);
+            free(sk2); free(sv2);
+        }
+    }
+
+    /* ---- First pass: discover ECPU/PCPU active state counts ---- */
+    int ecpu_active_states = 0, pcpu_active_states = 0;
+    for (int i = 0; i < n_pairs; i++) {
+        CFDictionaryRef entry = pairs[i].ch;
+        CFStringRef name = ior_ChannelGetChannelName(entry);
+        int32_t fmt = ior_ChannelGetFormat(entry);
+        if (!name || fmt != kIOReportFormatState) continue;
+
+        int is_ecpu = cfstr_eq(name, "ECPU");
+        int is_pcpu = cfstr_eq(name, "PCPU");
+        if (!is_ecpu && !is_pcpu) continue;
+        if (is_ecpu && ecpu_active_states > 0) continue;
+        if (is_pcpu && pcpu_active_states > 0) continue;
+
+        int32_t sc = ior_StateGetCount(entry);
+        int active = 0;
+        for (int32_t s = 0; s < sc; s++) {
+            CFStringRef sn = ior_StateGetNameForIndex(entry, s);
+            if (sn && !cfstr_eq(sn, "OFF") && !cfstr_eq(sn, "IDLE"))
+                active++;
+        }
+        if (is_ecpu) ecpu_active_states = active;
+        else         pcpu_active_states = active;
+    }
+
+    /* ---- Read CPU DVFS frequency tables from pmgr ---- */
+    /* P-cores: voltage-states8 (consistent across chips).
+     * E-cores: varies by chip — scan all voltage-states* properties and
+     * pick the one whose non-zero entry count matches the ECPU state count. */
+    long ecpu_mhz[MAX_PSTATES], pcpu_mhz[MAX_PSTATES];
+    int ecpu_count = 0, pcpu_count = 0;
+    {
+        io_iterator_t dvfs_iter;
+        kern_return_t dvfs_kr = IOServiceGetMatchingServices(
+            kIOMainPortDefault, IOServiceMatching("AppleARMIODevice"), &dvfs_iter);
+        if (dvfs_kr == KERN_SUCCESS) {
+            io_service_t svc;
+            while ((svc = IOIteratorNext(dvfs_iter)) != 0) {
+                io_name_t svc_name;
+                IORegistryEntryGetName(svc, svc_name);
+                if (strcmp(svc_name, "pmgr") == 0) {
+                    /* P-core table: voltage-states8 */
+                    CFDataRef pdata = IORegistryEntryCreateCFProperty(
+                        svc, CFSTR("voltage-states8"), kCFAllocatorDefault, 0);
+                    if (pdata && CFGetTypeID(pdata) == CFDataGetTypeID()) {
+                        CFIndex len = CFDataGetLength(pdata);
+                        const uint8_t *p = CFDataGetBytePtr(pdata);
+                        for (CFIndex off = 0; off + 7 < len && pcpu_count < MAX_PSTATES; off += 8) {
+                            uint32_t fhz;
+                            memcpy(&fhz, p + off, 4);
+                            if (fhz > 0)
+                                pcpu_mhz[pcpu_count++] = fhz / 1000000;
+                        }
+                    }
+                    if (pdata) CFRelease(pdata);
+
+                    /* E-core table: scan voltage-states0..31 (skip 8=P, 9=GPU)
+                     * looking for non-zero table with entry count matching
+                     * the ECPU active state count. */
+                    if (ecpu_active_states > 0) {
+                        for (int idx = 0; idx < 32 && ecpu_count == 0; idx++) {
+                            if (idx == 8 || idx == 9) continue;  /* P-core / GPU */
+                            char prop[32];
+                            snprintf(prop, sizeof(prop), "voltage-states%d", idx);
+                            /* Skip -sram variants (handled by property name) */
+                            CFStringRef key = CFStringCreateWithCString(
+                                kCFAllocatorDefault, prop, kCFStringEncodingUTF8);
+                            CFDataRef edata = IORegistryEntryCreateCFProperty(
+                                svc, key, kCFAllocatorDefault, 0);
+                            CFRelease(key);
+                            if (!edata) continue;
+                            if (CFGetTypeID(edata) != CFDataGetTypeID()) {
+                                CFRelease(edata);
+                                continue;
+                            }
+                            CFIndex len = CFDataGetLength(edata);
+                            const uint8_t *p = CFDataGetBytePtr(edata);
+                            /* Count entries with freq >= 100 MHz (CPU core range).
+                             * Filters out non-CPU clock domains (kHz-range). */
+                            long tmp_mhz[MAX_PSTATES];
+                            int tmp_count = 0;
+                            for (CFIndex off = 0; off + 7 < len && tmp_count < MAX_PSTATES; off += 8) {
+                                uint32_t fhz;
+                                memcpy(&fhz, p + off, 4);
+                                long mhz = fhz / 1000000;
+                                if (mhz >= 100)
+                                    tmp_mhz[tmp_count++] = mhz;
+                            }
+                            CFRelease(edata);
+                            /* Match: entry count == ECPU active states,
+                             * and lowest freq < P-core lowest (E-cores are slower) */
+                            if (tmp_count == ecpu_active_states
+                                && tmp_count > 0
+                                && (pcpu_count == 0 || tmp_mhz[0] < pcpu_mhz[0])) {
+                                memcpy(ecpu_mhz, tmp_mhz, tmp_count * sizeof(long));
+                                ecpu_count = tmp_count;
+                            }
+                        }
+                    }
+
+                    IOObjectRelease(svc);
+                    break;
+                }
+                IOObjectRelease(svc);
+            }
+            IOObjectRelease(dvfs_iter);
+        }
+    }
+
+    /* ---- Second pass: parse CPU energy + cluster residency ---- */
+    PyObject *clusters = PyDict_New();
+
+    for (int i = 0; i < n_pairs; i++) {
+        CFDictionaryRef entry = pairs[i].ch;
+        CFDictionaryRef entry1 = pairs[i].ch1;
+        CFStringRef name = ior_ChannelGetChannelName(entry);
+        int32_t fmt = ior_ChannelGetFormat(entry);
+
+        if (!name) continue;
+
+        /* CPU Energy (Simple, delta nanojoules) */
+        if (fmt == kIOReportFormatSimple && cfstr_eq(name, "CPU Energy")) {
+            int64_t e2 = ior_SimpleGetIntegerValue(entry, NULL);
+            int64_t e1 = ior_SimpleGetIntegerValue(entry1, NULL);
+            int64_t energy_nj = e2 - e1;
+            double watts = (double)energy_nj / (interval * 1e9);
+
+            PyObject *v;
+            v = PyFloat_FromDouble(watts);
+            PyDict_SetItemString(result, "cpu_power_w", v);
+            Py_DECREF(v);
+            v = PyLong_FromLongLong(energy_nj);
+            PyDict_SetItemString(result, "cpu_energy_nj", v);
+            Py_DECREF(v);
+        }
+
+        /* ECPU / PCPU P-state residency (State channels) */
+        if (fmt == kIOReportFormatState) {
+            char nbuf[64];
+            if (!CFStringGetCString(name, nbuf, sizeof(nbuf), kCFStringEncodingUTF8))
+                continue;
+
+            int is_ecpu = (strcmp(nbuf, "ECPU") == 0);
+            int is_pcpu = (strcmp(nbuf, "PCPU") == 0);
+            if (!is_ecpu && !is_pcpu) continue;
+
+            const char *cluster_name = is_ecpu ? "ECPU" : "PCPU";
+            long *dvfs = is_ecpu ? ecpu_mhz : pcpu_mhz;
+            int dvfs_cnt = is_ecpu ? ecpu_count : pcpu_count;
+
+            PyObject *existing = PyDict_GetItemString(clusters, cluster_name);
+            if (existing) continue;
+
+            int32_t state_count = ior_StateGetCount(entry);
+            int64_t total_res = 0;
+            for (int32_t s = 0; s < state_count; s++) {
+                int64_t r2 = ior_StateGetResidency(entry, s);
+                int64_t r1 = ior_StateGetResidency(entry1, s);
+                total_res += (r2 - r1);
+            }
+
+            PyObject *freq_states = PyList_New(0);
+            double weighted_freq = 0;
+            double active_pct = 0;
+
+            for (int32_t s = 0; s < state_count; s++) {
+                CFStringRef sname = ior_StateGetNameForIndex(entry, s);
+                int64_t r2 = ior_StateGetResidency(entry, s);
+                int64_t r1 = ior_StateGetResidency(entry1, s);
+                int64_t res = r2 - r1;
+                if (res <= 0 || !sname) continue;
+
+                double pct = total_res > 0 ? (double)res / total_res * 100.0 : 0;
+                if (cfstr_eq(sname, "OFF") || cfstr_eq(sname, "IDLE")) continue;
+
+                char sbuf[16];
+                long freq = 0;
+                if (CFStringGetCString(sname, sbuf, sizeof(sbuf), kCFStringEncodingUTF8)) {
+                    if (sbuf[0] == 'P') {
+                        int pindex = atoi(sbuf + 1);
+                        if (pindex >= 1 && pindex <= dvfs_cnt)
+                            freq = dvfs[pindex - 1];
+                    } else if (sbuf[0] == 'V') {
+                        int vindex = atoi(sbuf + 1);
+                        if (vindex >= 0 && vindex < dvfs_cnt)
+                            freq = dvfs[vindex];
+                    }
+                }
+
+                active_pct += pct;
+                if (freq > 0)
+                    weighted_freq += freq * (pct / 100.0);
+
+                PyObject *sd = PyDict_New();
+                PyObject *v;
+                v = cfstr_to_pystr(sname);
+                PyDict_SetItemString(sd, "state", v);
+                Py_DECREF(v);
+                v = PyFloat_FromDouble(pct);
+                PyDict_SetItemString(sd, "residency_pct", v);
+                Py_DECREF(v);
+                if (freq > 0) {
+                    v = PyLong_FromLong(freq);
+                    PyDict_SetItemString(sd, "freq_mhz", v);
+                    Py_DECREF(v);
+                }
+                PyList_Append(freq_states, sd);
+                Py_DECREF(sd);
+            }
+
+            PyObject *cluster_dict = PyDict_New();
+            PyDict_SetItemString(cluster_dict, "frequency_states", freq_states);
+            Py_DECREF(freq_states);
+
+            if (active_pct > 0) {
+                double avg_freq = weighted_freq / (active_pct / 100.0);
+                PyObject *v = PyLong_FromLong((long)avg_freq);
+                PyDict_SetItemString(cluster_dict, "freq_mhz", v);
+                Py_DECREF(v);
+            }
+
+            {
+                PyObject *v = PyFloat_FromDouble(active_pct);
+                PyDict_SetItemString(cluster_dict, "active_pct", v);
+                Py_DECREF(v);
+            }
+
+            PyDict_SetItemString(clusters, cluster_name, cluster_dict);
+            Py_DECREF(cluster_dict);
+        }
+    }
+
+    PyDict_SetItemString(result, "clusters", clusters);
+    Py_DECREF(clusters);
+
+
+    /* Cleanup */
+    free(pairs);
+    CFRelease(s1);
+    CFRelease(s2);
+    CFRelease(channels);
+    CFRelease(energy_group);
+    CFRelease(cpu_group);
+
+    return result;
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Module definition                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -1383,6 +2040,8 @@ static PyMethodDef methods[] = {
     {"gpu_power",         py_gpu_power,         METH_VARARGS, gpu_power_doc},
     {"gpu_freq_table",    py_gpu_freq_table,    METH_NOARGS,  gpu_freq_table_doc},
     {"system_stats",      py_system_stats,      METH_NOARGS,  system_stats_doc},
+    {"cpu_power",         py_cpu_power,         METH_VARARGS, cpu_power_doc},
+    {"temperatures",      py_temperatures,      METH_NOARGS,  temperatures_doc},
     {NULL, NULL, 0, NULL}
 };
 

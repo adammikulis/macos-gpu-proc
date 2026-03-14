@@ -1,13 +1,13 @@
-"""gpu-proc: Live per-process GPU utilization monitor for macOS.
+"""darwin-perf: Live per-process GPU utilization monitor for macOS.
 
 Like `top` or `htop`, but for GPU. Auto-discovers all processes using
 the GPU via IORegistry — no sudo needed.
 
 Usage:
-    gpu-proc              # monitor all GPU-active processes
-    gpu-proc --pid 1234   # monitor specific PID
-    gpu-proc --top 10     # show top 10 GPU consumers
-    gpu-proc -i 1         # update every 1 second
+    darwin-perf              # monitor all GPU-active processes
+    darwin-perf --pid 1234   # monitor specific PID
+    darwin-perf --top 10     # show top 10 GPU consumers
+    darwin-perf -i 1         # update every 1 second
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def _format_table(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="gpu-proc",
+        prog="darwin-perf",
         description="Live per-process GPU utilization monitor for macOS.",
     )
     parser.add_argument(
@@ -152,7 +152,7 @@ def main() -> None:
             print("\033[2J\033[H", end="")
 
         timestamp = time.strftime("%H:%M:%S")
-        print(f"gpu-proc  {timestamp}  (every {args.interval}s)\n")
+        print(f"darwin-perf  {timestamp}  (every {args.interval}s)\n")
 
         if rows:
             print(_format_table(rows))

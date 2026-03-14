@@ -1,4 +1,4 @@
-"""gpu-proc GUI: Native floating window GPU monitor.
+"""darwin-perf GUI: Native floating window GPU monitor.
 
 A compact, resizable native window showing live per-process GPU utilization,
 CPU, memory, and history charts. Designed to tuck in a corner while training.
@@ -6,8 +6,8 @@ CPU, memory, and history charts. Designed to tuck in a corner while training.
 Uses pywebview for a native macOS window (no browser chrome).
 
 Usage:
-    gpu-proc --gui
-    gpu-proc --gui -i 1
+    darwin-perf --gui
+    darwin-perf --gui -i 1
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ canvas {
 </head>
 <body>
 <div class="header">
-    <span class="title">gpu-proc</span>
+    <span class="title">darwin-perf</span>
     <span class="stats" id="stats">--</span>
 </div>
 
@@ -295,7 +295,7 @@ def run_gui(interval: float = 2.0, width: int = 380, height: int = 520) -> None:
 
     api = _GpuGuiApi(interval=interval)
     window = webview.create_window(
-        "gpu-proc",
+        "darwin-perf",
         html=_HTML,
         width=width,
         height=height,

@@ -1,19 +1,19 @@
-# macos-gpu-proc
+# darwin-perf
 
-Per-process GPU utilization, CPU, memory, and energy monitoring for macOS Apple Silicon. **No sudo needed.**
+System performance monitoring for macOS Apple Silicon — GPU, CPU, memory, energy, and disk I/O via Mach kernel APIs. **No sudo needed.**
 
 Reads GPU client data directly from the IORegistry — the same data source Activity Monitor uses. Auto-discovers every process using the GPU.
 
 ## Install
 
 ```bash
-pip install macos-gpu-proc
+pip install darwin-perf
 ```
 
 ## Quick Start
 
 ```python
-from macos_gpu_proc import snapshot
+from darwin_perf import snapshot
 
 # One call — auto-discovers all GPU processes, returns utilization %
 for proc in snapshot():
@@ -32,7 +32,7 @@ Each dict in the list contains: `pid`, `name`, `gpu_percent`, `cpu_percent`, `me
 ### GPU Power & Frequency
 
 ```python
-from macos_gpu_proc import gpu_power
+from darwin_perf import gpu_power
 
 power = gpu_power(interval=1.0)  # samples over 1 second
 print(f"GPU Power: {power['gpu_power_w']:.2f}W")
@@ -47,22 +47,28 @@ Uses `libIOReport.dylib` (the same data source as `powermetrics`). No sudo neede
 ### GPU DVFS Frequency Table
 
 ```python
-from macos_gpu_proc import gpu_freq_table
+from darwin_perf import gpu_freq_table
 
 for i, freq in enumerate(gpu_freq_table()):
     print(f"P{i+1}: {freq} MHz")
 # P1: 338 MHz, P2: 618 MHz, ..., P15: 1578 MHz
 ```
 
-### System-Wide GPU
+### System-Wide Stats
 
 ```python
-from macos_gpu_proc import system_gpu_stats
+from darwin_perf import system_stats, system_gpu_stats
 
-stats = system_gpu_stats()
-print(f"{stats['model']} ({stats['gpu_core_count']} cores)")
-print(f"Device utilization: {stats['device_utilization']}%")
-print(f"GPU VRAM in use: {stats['in_use_system_memory']/1e9:.1f}GB")
+# System memory + CPU (instant, ~3µs)
+sys = system_stats()
+print(f"RAM: {sys['memory_used']/1e9:.1f} / {sys['memory_total']/1e9:.1f} GB")
+print(f"CPU idle: {sys['cpu_idle_pct']:.1f}%")
+
+# GPU utilization + model info
+gpu = system_gpu_stats()
+print(f"{gpu['model']} ({gpu['gpu_core_count']} cores)")
+print(f"Device utilization: {gpu['device_utilization']}%")
+print(f"GPU VRAM in use: {gpu['in_use_system_memory']/1e9:.1f}GB")
 ```
 
 ### GpuMonitor (continuous monitoring)
@@ -70,7 +76,7 @@ print(f"GPU VRAM in use: {stats['in_use_system_memory']/1e9:.1f}GB")
 Monitor your own training process — no PID lookup needed:
 
 ```python
-from macos_gpu_proc import GpuMonitor
+from darwin_perf import GpuMonitor
 
 mon = GpuMonitor()  # monitors the current process
 for batch in dataloader:
@@ -87,7 +93,7 @@ print(mon.summary())  # {'gpu_pct_avg': 42.1, 'gpu_pct_max': 87.3, ...}
 ### Low-Level Access
 
 ```python
-from macos_gpu_proc import gpu_clients, gpu_time_ns, proc_info
+from darwin_perf import gpu_clients, gpu_time_ns, proc_info
 
 # All GPU clients (raw cumulative data)
 for c in gpu_clients():
@@ -101,13 +107,13 @@ print(f"Memory: {info['memory']/1e6:.0f}MB, Energy: {info['energy_nj']/1e9:.1f}J
 ## CLI
 
 ```bash
-gpu-proc              # live per-process GPU monitor — auto-discovers all GPU processes
-gpu-proc --once       # single snapshot
-gpu-proc --tui        # rich terminal UI with sparkline graphs (pip install macos-gpu-proc[tui])
-gpu-proc --gui        # native floating window monitor (pip install macos-gpu-proc[gui])
-gpu-proc -i 1         # 1-second update interval
-gpu-proc --pid 1234   # monitor specific PID
-python -m macos_gpu_proc  # alternative entry point (same as gpu-proc)
+darwin-perf              # live per-process GPU monitor — auto-discovers all GPU processes
+darwin-perf --once       # single snapshot
+darwin-perf --tui        # rich terminal UI with sparkline graphs (pip install darwin-perf[tui])
+darwin-perf --gui        # native floating window monitor (pip install darwin-perf[gui])
+darwin-perf -i 1         # 1-second update interval
+darwin-perf --pid 1234   # monitor specific PID
+python -m darwin_perf    # alternative entry point (same as darwin-perf)
 ```
 
 ## API Reference
@@ -118,6 +124,7 @@ python -m macos_gpu_proc  # alternative entry point (same as gpu-proc)
 |----------|-------------|
 | `snapshot(interval=1.0)` | **One call does it all** — returns `[{'pid', 'name', 'gpu_percent', 'cpu_percent', 'memory_mb', 'energy_w', ...}]` |
 | `snapshot(detailed=True)` | Extended fields: IPC, wakeups, peak memory, neural engine, disk I/O |
+| `system_stats()` | System-wide memory + CPU ticks (instant, ~3µs) |
 
 ### C Extension Functions
 
@@ -128,6 +135,7 @@ python -m macos_gpu_proc  # alternative entry point (same as gpu-proc)
 | `gpu_time_ns_multi(pids)` | Batch GPU ns for multiple PIDs (single IORegistry scan) |
 | `cpu_time_ns(pid)` | Cumulative CPU nanoseconds (user + system) |
 | `proc_info(pid)` | Full process stats (CPU, memory, energy, disk, threads) |
+| `system_stats()` | System-wide memory + CPU ticks via Mach APIs |
 | `system_gpu_stats()` | System GPU: utilization %, VRAM, model, core count |
 | `gpu_power(interval)` | GPU power (watts), frequency (MHz), P-state residency, thermal throttling |
 | `gpu_freq_table()` | GPU DVFS frequency table (MHz per P-state) from pmgr |

@@ -1,11 +1,11 @@
-"""gpu-proc TUI: Rich terminal GPU monitor with live graphs.
+"""darwin-perf TUI: Rich terminal GPU monitor with live graphs.
 
 A full-screen terminal app showing per-process GPU utilization with
 sparkline history graphs, sorted by usage. No sudo needed.
 
 Usage:
-    gpu-proc --tui              # all GPU-active processes
-    gpu-proc --tui -i 1         # 1s update interval
+    darwin-perf --tui              # all GPU-active processes
+    darwin-perf --tui -i 1         # 1s update interval
 """
 
 from __future__ import annotations

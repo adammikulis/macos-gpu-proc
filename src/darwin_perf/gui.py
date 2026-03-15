@@ -16,6 +16,8 @@ import json
 import threading
 import time
 
+from ._sampler import PowerSampler
+
 _HTML = """<!DOCTYPE html>
 <html>
 <head>
@@ -24,7 +26,7 @@ _HTML = """<!DOCTYPE html>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
     background: #0f172a; color: #e2e8f0; font-family: -apple-system, system-ui, sans-serif;
-    font-size: 12px; padding: 8px; overflow: hidden; height: 100vh;
+    font-size: 12px; padding: 8px; overflow-y: auto; overflow-x: hidden; height: 100vh;
     display: flex; flex-direction: column;
 }
 .header {
@@ -37,7 +39,11 @@ body {
 .stats b { color: #10b981; }
 
 .gpu-section { flex-shrink: 0; margin-bottom: 8px; }
-.section-label { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+.section-label {
+    font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px;
+    margin-bottom: 4px; cursor: pointer; user-select: none;
+}
+.section-label:hover { color: #94a3b8; }
 .bar-row { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
 .bar-label { font-size: 11px; color: #94a3b8; width: 50px; flex-shrink: 0; }
 .bar-track { flex: 1; height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; }
@@ -47,21 +53,50 @@ body {
 .fill-gpu { background: #8b5cf6; }
 .fill-cpu { background: #64748b; }
 .fill-mem { background: #10b981; }
+.fill-tiler { background: #06b6d4; }
+.fill-renderer { background: #ec4899; }
+.fill-active { background: #22c55e; }
+.fill-inactive { background: #eab308; }
+.fill-wired { background: #ef4444; }
+.fill-compressed { background: #06b6d4; }
 
 canvas {
-    flex: 1; min-height: 60px; width: 100%; border-radius: 4px;
+    flex-shrink: 0; min-height: 60px; max-height: 80px; width: 100%; border-radius: 4px;
     background: #1e293b; margin-top: 4px;
 }
 .proc-list { flex: 1; overflow-y: auto; min-height: 0; margin-top: 6px; }
 .proc-row {
     display: flex; align-items: center; gap: 6px; padding: 2px 0;
-    border-bottom: 1px solid #1e293b20;
+    border-bottom: 1px solid #1e293b20; cursor: pointer;
 }
+.proc-row:hover { background: #1e293b40; }
 .proc-name { font-size: 11px; color: #cbd5e1; width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .proc-pid { font-size: 10px; color: #475569; width: 50px; text-align: right; font-family: monospace; }
 .proc-bar { flex: 1; height: 4px; background: #1e293b; border-radius: 2px; overflow: hidden; }
 .proc-fill-gpu { height: 100%; background: #8b5cf6; border-radius: 2px; transition: width 0.5s; }
 .proc-val { font-size: 10px; color: #94a3b8; width: 50px; text-align: right; font-family: monospace; }
+.proc-detail {
+    font-size: 10px; color: #64748b; padding: 2px 0 4px 56px; line-height: 1.5;
+    display: none; border-bottom: 1px solid #1e293b40;
+}
+
+.collapsible { display: none; margin-bottom: 8px; }
+.collapsible.open { display: block; }
+
+.detail-row { font-size: 11px; color: #94a3b8; padding: 1px 0; }
+.detail-label { color: #64748b; display: inline-block; width: 80px; }
+.detail-val { color: #e2e8f0; font-family: 'SF Mono', 'Menlo', monospace; }
+.pstate-bar { display: inline-block; height: 8px; border-radius: 2px; margin-right: 1px; }
+.throttle-badge { color: #ef4444; font-weight: 600; font-size: 10px; }
+
+/* Responsive two-column layout */
+@media (min-width: 600px) {
+    body { flex-direction: row; flex-wrap: wrap; gap: 12px; }
+    .header { width: 100%; flex-shrink: 0; }
+    .col-left { flex: 1; min-width: 280px; display: flex; flex-direction: column; }
+    .col-right { flex: 1; min-width: 280px; display: flex; flex-direction: column; overflow-y: auto; }
+    .col-right .collapsible { display: block !important; }
+}
 </style>
 </head>
 <body>
@@ -70,6 +105,7 @@ canvas {
     <span class="stats" id="stats">--</span>
 </div>
 
+<div class="col-left">
 <div class="gpu-section">
     <div class="bar-row">
         <span class="bar-label">GPU</span>
@@ -89,7 +125,7 @@ canvas {
     <div class="bar-row" style="cursor:pointer" onclick="toggleSensors()">
         <span class="bar-label">Temps</span>
         <span class="bar-value" id="temp-val" style="width:auto;flex:1;text-align:left;color:#f59e0b">--</span>
-        <span id="temp-toggle" style="color:#475569;font-size:10px">▶ sensors</span>
+        <span id="temp-toggle" style="color:#475569;font-size:10px">&#x25B6; sensors</span>
     </div>
     <div id="sensor-detail" style="display:none;font-size:10px;color:#94a3b8;padding:2px 0 4px 56px;line-height:1.6"></div>
 </div>
@@ -99,12 +135,28 @@ canvas {
 
 <div class="section-label" style="margin-top:6px">Top Processes (GPU)</div>
 <div class="proc-list" id="procs"></div>
+</div>
+
+<div class="col-right">
+<!-- Power & Frequency section -->
+<div class="section-label" onclick="toggleSection('power-section')">&#x26A1; Power &amp; Frequency <span id="power-toggle" style="font-size:10px;color:#475569">&#x25B6;</span></div>
+<div class="collapsible" id="power-section"></div>
+
+<!-- GPU Detail section -->
+<div class="section-label" onclick="toggleSection('gpu-detail-section')">&#x1F3AE; GPU Detail <span id="gpu-detail-toggle" style="font-size:10px;color:#475569">&#x25B6;</span></div>
+<div class="collapsible" id="gpu-detail-section"></div>
+
+<!-- Memory Breakdown section -->
+<div class="section-label" onclick="toggleSection('memory-section')">&#x1F4BE; Memory Breakdown <span id="memory-toggle" style="font-size:10px;color:#475569">&#x25B6;</span></div>
+<div class="collapsible" id="memory-section"></div>
+</div>
 
 <script>
 const gpuHistory = [];
 const MAX_HIST = 120;
 const canvas = document.getElementById('chart');
 const ctx = canvas.getContext('2d');
+let expandedPid = null;
 
 function drawChart() {
     const dpr = window.devicePixelRatio || 1;
@@ -140,13 +192,25 @@ function drawChart() {
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // Grid lines
     ctx.strokeStyle = '#1e293b80';
     ctx.lineWidth = 0.5;
     for (let pct of [25, 50, 75]) {
         const y = h - (pct / maxV) * h;
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
     }
+}
+
+function fmtBytes(b) {
+    if (b < 1024) return b + 'B';
+    if (b < 1024*1024) return (b/1024).toFixed(0) + 'K';
+    if (b < 1024*1024*1024) return (b/(1024*1024)).toFixed(0) + 'M';
+    return (b/(1024*1024*1024)).toFixed(1) + 'G';
+}
+
+function barHtml(pct, cls, w) {
+    w = w || 80;
+    return '<div style="display:inline-block;width:'+w+'px;height:6px;background:#1e293b;border-radius:3px;overflow:hidden;vertical-align:middle">' +
+        '<div style="width:'+Math.min(pct,100)+'%;height:100%;border-radius:3px" class="'+cls+'"></div></div>';
 }
 
 function update(data) {
@@ -167,7 +231,7 @@ function update(data) {
     document.getElementById('stats').innerHTML =
         '<b>' + data.gpu_clients + ' clients</b>';
     document.getElementById('temp-val').textContent =
-        'CPU ' + ct + '°C  GPU ' + gt + '°C';
+        'CPU ' + ct + '\\u00B0C  GPU ' + gt + '\\u00B0C';
     if (data.sensors) updateSensors(data.sensors);
 
     // History
@@ -175,19 +239,68 @@ function update(data) {
     if (gpuHistory.length > MAX_HIST) gpuHistory.shift();
     drawChart();
 
-    // Process list (sorted by GPU%)
+    // Process list
     const procs = data.processes || [];
     const el = document.getElementById('procs');
-    el.innerHTML = procs.slice(0, 15).map(p =>
-        '<div class="proc-row">' +
-        '<span class="proc-pid">' + p.pid + '</span>' +
-        '<span class="proc-name">' + p.name + '</span>' +
-        '<div class="proc-bar"><div class="proc-fill-gpu" style="width:' + Math.min(p.gpu, 100) + '%"></div></div>' +
-        '<span class="proc-val">' + p.gpu.toFixed(1) + '% gpu</span>' +
-        '<span class="proc-val">' + p.cpu.toFixed(0) + '% cpu</span>' +
-        '<span class="proc-val">' + p.mem.toFixed(0) + 'MB</span>' +
-        '</div>'
-    ).join('');
+    el.innerHTML = procs.slice(0, 15).map(function(p) {
+        const isExpanded = expandedPid === p.pid;
+        let html = '<div class="proc-row" onclick="toggleProcDetail('+p.pid+')">' +
+            '<span class="proc-pid">' + p.pid + '</span>' +
+            '<span class="proc-name">' + p.name + '</span>' +
+            '<div class="proc-bar"><div class="proc-fill-gpu" style="width:' + Math.min(p.gpu, 100) + '%"></div></div>' +
+            '<span class="proc-val">' + p.gpu.toFixed(1) + '% gpu</span>' +
+            '<span class="proc-val">' + p.cpu.toFixed(0) + '% cpu</span>' +
+            '<span class="proc-val">' + p.mem.toFixed(0) + 'MB</span>' +
+            '</div>';
+        if (isExpanded && p.detail) {
+            const d = p.detail;
+            const ipc = d.cycles > 0 ? (d.instructions / d.cycles).toFixed(2) : '0';
+            const MB = 1024*1024;
+            html += '<div class="proc-detail" style="display:block">' +
+                'threads=' + d.threads +
+                '  disk: R=' + (d.disk_read_bytes/MB).toFixed(1) + 'M W=' + (d.disk_write_bytes/MB).toFixed(1) + 'M' +
+                '  IPC=' + ipc +
+                '  peak=' + (d.peak_memory/MB).toFixed(0) + 'M' +
+                '  wired=' + (d.wired_size/MB).toFixed(0) + 'M' +
+                '  neural=' + (d.neural_footprint/MB).toFixed(0) + 'M' +
+                '<br>wakeups: idle=' + d.idle_wakeups + ' int=' + d.interrupt_wakeups +
+                '  pageins=' + d.pageins +
+                '  CPU: usr=' + ((d.cpu_user_ns/(d.cpu_user_ns+d.cpu_system_ns+1))*100).toFixed(0) + '%' +
+                ' sys=' + ((d.cpu_system_ns/(d.cpu_user_ns+d.cpu_system_ns+1))*100).toFixed(0) + '%' +
+                '</div>';
+        }
+        return html;
+    }).join('');
+
+    // Power section
+    if (data.cpu_power || data.gpu_power) {
+        updatePowerSection(data.cpu_power, data.gpu_power);
+    }
+
+    // GPU detail section
+    if (data.gpu_detail) {
+        updateGpuDetailSection(data.gpu_detail);
+    }
+
+    // Memory breakdown section
+    if (data.memory_breakdown) {
+        updateMemorySection(data.memory_breakdown);
+    }
+}
+
+function toggleProcDetail(pid) {
+    expandedPid = expandedPid === pid ? null : pid;
+}
+
+function toggleSection(id) {
+    const el = document.getElementById(id);
+    const isWide = window.innerWidth >= 600;
+    if (isWide) return; // auto-expanded in wide mode
+    el.classList.toggle('open');
+    const toggleEl = document.getElementById(id + '-toggle');
+    if (toggleEl) {
+        toggleEl.innerHTML = el.classList.contains('open') ? '&#x25BC;' : '&#x25B6;';
+    }
 }
 
 let sensorsVisible = false;
@@ -196,7 +309,7 @@ function toggleSensors() {
     const el = document.getElementById('sensor-detail');
     const tog = document.getElementById('temp-toggle');
     el.style.display = sensorsVisible ? 'block' : 'none';
-    tog.textContent = sensorsVisible ? '▼ sensors' : '▶ sensors';
+    tog.innerHTML = sensorsVisible ? '&#x25BC; sensors' : '&#x25B6; sensors';
 }
 
 function updateSensors(sensors) {
@@ -211,21 +324,155 @@ function updateSensors(sensors) {
         const s = sensors[cat] || {};
         const keys = Object.keys(s).sort();
         if (keys.length === 0) continue;
-        const vals = keys.map(k =>
-            k + ':' + s[k].toFixed(0)
-        ).join('  ');
+        const vals = keys.map(function(k) {
+            return k + ':' + s[k].toFixed(0);
+        }).join('  ');
         html += '<span style="color:' + color + '">' +
             label + '</span> ' + vals + '<br>';
     }
     el.innerHTML = html || 'No sensors';
 }
 
-window.addEventListener('resize', drawChart);
+function updatePowerSection(cpuPwr, gpuPwr) {
+    const el = document.getElementById('power-section');
+    if (!cpuPwr && !gpuPwr) { el.innerHTML = '<div class="detail-row" style="color:#475569">Waiting for power data...</div>'; return; }
+
+    let html = '';
+    // GPU power
+    if (gpuPwr) {
+        const throttle = gpuPwr.throttled ? ' <span class="throttle-badge">THROTTLED</span>' : '';
+        html += '<div class="detail-row">' +
+            '<span class="detail-label">GPU</span>' +
+            '<span class="detail-val">' + (gpuPwr.gpu_power_w||0).toFixed(1) + 'W  ' +
+            (gpuPwr.gpu_freq_mhz||0) + 'MHz</span>' +
+            '  state=' + (gpuPwr.active_state||'-') +
+            '  pwr_limit=' + (gpuPwr.power_limit_pct||0) + '%' +
+            throttle + '</div>';
+
+        // GPU P-states
+        const states = gpuPwr.frequency_states || [];
+        if (states.length > 0) {
+            html += '<div class="detail-row" style="font-size:10px">';
+            states.forEach(function(s) {
+                if (s.residency_pct > 0.5) {
+                    const w = Math.max(2, s.residency_pct * 0.8);
+                    html += '<span class="pstate-bar" style="width:'+w+'px;background:#8b5cf6"></span>';
+                }
+            });
+            html += ' ';
+            states.filter(function(s){return s.residency_pct > 0.5}).forEach(function(s) {
+                html += (s.freq_mhz||0) + ':' + s.residency_pct.toFixed(0) + '%  ';
+            });
+            html += '</div>';
+        }
+    }
+
+    // CPU power
+    if (cpuPwr) {
+        html += '<div class="detail-row">' +
+            '<span class="detail-label">CPU</span>' +
+            '<span class="detail-val">' + (cpuPwr.cpu_power_w||0).toFixed(1) + 'W</span></div>';
+
+        const clusters = cpuPwr.clusters || {};
+        Object.keys(clusters).sort().forEach(function(name) {
+            const c = clusters[name];
+            html += '<div class="detail-row" style="padding-left:16px">' +
+                name + ': ' + (c.freq_mhz||0) + 'MHz  active=' + (c.active_pct||0).toFixed(0) + '%';
+            const cs = c.frequency_states || [];
+            if (cs.length > 0) {
+                html += '  <span style="font-size:10px;color:#475569">';
+                cs.filter(function(s){return s.residency_pct > 0.5}).forEach(function(s) {
+                    html += (s.freq_mhz||0) + ':' + s.residency_pct.toFixed(0) + '%  ';
+                });
+                html += '</span>';
+            }
+            html += '</div>';
+        });
+    }
+
+    el.innerHTML = html;
+}
+
+function updateGpuDetailSection(g) {
+    const el = document.getElementById('gpu-detail-section');
+    const dev = g.device_utilization || 0;
+    const tiler = g.tiler_utilization || 0;
+    const rend = g.renderer_utilization || 0;
+
+    let html = '<div class="detail-row">' +
+        'Device ' + barHtml(dev, 'fill-gpu', 80) + ' ' + dev + '%  ' +
+        'Tiler ' + barHtml(tiler, 'fill-tiler', 80) + ' ' + tiler + '%  ' +
+        'Renderer ' + barHtml(rend, 'fill-renderer', 80) + ' ' + rend + '%</div>';
+
+    html += '<div class="detail-row">' +
+        '<span class="detail-label">Memory</span>' +
+        'in_use=' + fmtBytes(g.in_use_system_memory||0) +
+        '  alloc=' + fmtBytes(g.alloc_system_memory||0) +
+        '  driver=' + fmtBytes(g.in_use_system_memory_driver||0) +
+        '  PB=' + fmtBytes(g.allocated_pb_size||0) + '</div>';
+
+    html += '<div class="detail-row">' +
+        '<span class="detail-label">Recovery</span>' +
+        'count=' + (g.recovery_count||0) +
+        '  last=' + (g.last_recovery_time||0) +
+        '  |  split_scenes=' + (g.split_scene_count||0) +
+        '  tiled=' + fmtBytes(g.tiled_scene_bytes||0) + '</div>';
+
+    el.innerHTML = html;
+}
+
+function updateMemorySection(m) {
+    const el = document.getElementById('memory-section');
+    const total = m.memory_total || 1;
+    const GB = 1024*1024*1024;
+
+    // Stacked bar
+    const pcts = {
+        active: (m.memory_active||0) / total * 100,
+        inactive: (m.memory_inactive||0) / total * 100,
+        wired: (m.memory_wired||0) / total * 100,
+        compressed: (m.memory_compressed||0) / total * 100,
+    };
+    const freePct = Math.max(0, 100 - pcts.active - pcts.inactive - pcts.wired - pcts.compressed);
+
+    let html = '<div class="detail-row" style="margin-bottom:4px">' +
+        '<div style="display:flex;height:10px;border-radius:4px;overflow:hidden;background:#1e293b">' +
+        '<div class="fill-active" style="width:'+pcts.active+'%"></div>' +
+        '<div class="fill-inactive" style="width:'+pcts.inactive+'%"></div>' +
+        '<div class="fill-wired" style="width:'+pcts.wired+'%"></div>' +
+        '<div class="fill-compressed" style="width:'+pcts.compressed+'%"></div>' +
+        '</div>' +
+        fmtBytes(m.memory_used||0) + ' / ' + fmtBytes(total) + '</div>';
+
+    html += '<div class="detail-row">' +
+        '<span style="color:#22c55e">active</span>=' + fmtBytes(m.memory_active||0) + '  ' +
+        '<span style="color:#eab308">inactive</span>=' + fmtBytes(m.memory_inactive||0) + '  ' +
+        '<span style="color:#ef4444">wired</span>=' + fmtBytes(m.memory_wired||0) + '  ' +
+        '<span style="color:#06b6d4">compressed</span>=' + fmtBytes(m.memory_compressed||0) + '  ' +
+        'free=' + fmtBytes(m.memory_free||0) + '  ' +
+        'avail=' + fmtBytes(m.memory_available||0) + '</div>';
+
+    html += '<div class="detail-row">' +
+        '<span class="detail-label">CPU</span>' +
+        (m.cpu_name||'?') + ' (' + (m.cpu_count||0) + ' cores)' +
+        '  usr=' + (m.cpu_user_pct||0).toFixed(1) + '%' +
+        '  sys=' + (m.cpu_system_pct||0).toFixed(1) + '%' +
+        '  idle=' + (m.cpu_idle_pct||0).toFixed(1) + '%</div>';
+
+    el.innerHTML = html;
+}
+
+window.addEventListener('resize', function() {
+    drawChart();
+    // In wide mode, auto-expand all collapsible sections
+    const isWide = window.innerWidth >= 600;
+    document.querySelectorAll('.collapsible').forEach(function(el) {
+        if (isWide) el.classList.add('open');
+    });
+});
 </script>
 </body>
 </html>"""
-
-
 
 
 class _GpuGuiApi:
@@ -237,17 +484,25 @@ class _GpuGuiApi:
         self._prev_snap: dict[int, dict] | None = None
         self._prev_cpu: dict[int, int] = {}
         self._prev_time: float = 0
+        self._power_sampler = PowerSampler(interval=max(interval, 1.0))
 
     def set_window(self, window: object) -> None:
         self._window = window
 
     def start_polling(self) -> None:
+        self._power_sampler.start()
         t = threading.Thread(target=self._poll_loop, daemon=True)
         t.start()
 
     def _collect(self) -> dict:
         from darwin_perf import _snapshot
-        from darwin_perf._native import cpu_time_ns, proc_info
+        from darwin_perf._native import (
+            cpu_time_ns,
+            proc_info,
+            system_gpu_stats,
+            system_stats,
+            temperatures,
+        )
 
         now = time.monotonic()
         snap = _snapshot()
@@ -280,13 +535,31 @@ class _GpuGuiApi:
                 total_cpu += cpu_pct
 
                 if gpu_pct >= 0.1 or gpu_delta > 0:
-                    procs.append({
+                    entry = {
                         "pid": pid,
                         "name": info["name"],
                         "gpu": round(gpu_pct, 1),
                         "cpu": round(cpu_pct, 1),
                         "mem": round(mem_mb, 0),
-                    })
+                    }
+                    # Full proc detail
+                    if pinfo:
+                        entry["detail"] = {
+                            "threads": pinfo.get("threads", 0),
+                            "disk_read_bytes": pinfo.get("disk_read_bytes", 0),
+                            "disk_write_bytes": pinfo.get("disk_write_bytes", 0),
+                            "instructions": pinfo.get("instructions", 0),
+                            "cycles": pinfo.get("cycles", 0),
+                            "peak_memory": pinfo.get("peak_memory", 0),
+                            "wired_size": pinfo.get("wired_size", 0),
+                            "neural_footprint": pinfo.get("neural_footprint", 0),
+                            "idle_wakeups": pinfo.get("idle_wakeups", 0),
+                            "interrupt_wakeups": pinfo.get("interrupt_wakeups", 0),
+                            "pageins": pinfo.get("pageins", 0),
+                            "cpu_user_ns": pinfo.get("cpu_user_ns", 0),
+                            "cpu_system_ns": pinfo.get("cpu_system_ns", 0),
+                        }
+                    procs.append(entry)
 
             procs.sort(key=lambda p: p["gpu"], reverse=True)
             data["processes"] = procs[:15]
@@ -297,7 +570,6 @@ class _GpuGuiApi:
             data["total_cpu_pct"] = 0
 
         # System memory + temperatures
-        from darwin_perf._native import system_stats, temperatures
         sys = system_stats()
         GB = 1024**3
         data["memory_total_gb"] = round(sys.get("memory_total", 0) / GB, 1)
@@ -312,13 +584,23 @@ class _GpuGuiApi:
             "system_sensors": temps.get("system_sensors", {}),
         }
 
+        # Power data (cached from background thread)
+        cpu_pwr, gpu_pwr = self._power_sampler.get()
+        data["cpu_power"] = cpu_pwr
+        data["gpu_power"] = gpu_pwr
+
+        # GPU detail — all system_gpu_stats fields
+        data["gpu_detail"] = system_gpu_stats()
+
+        # Memory breakdown — all system_stats fields
+        data["memory_breakdown"] = sys
+
         self._prev_snap = snap
         self._prev_cpu = curr_cpu
         self._prev_time = now
         return data
 
     def _poll_loop(self) -> None:
-        # Take initial baseline
         from darwin_perf import _snapshot
         from darwin_perf._native import cpu_time_ns
         self._prev_snap = _snapshot()
